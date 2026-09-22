@@ -726,7 +726,7 @@ enum Commands {
         window: Option<String>,
     },
 
-    /// Reflow sidebar layouts in all windows (internal use, called by tmux hooks)
+    /// Reflow sidebar layouts in all windows (internal use)
     #[command(hide = true, name = "_sidebar-reflow-all")]
     SidebarReflowAll {
         /// Exclude this window ID from reflow (e.g. the window that just lost a pane)
@@ -888,6 +888,16 @@ pub enum SidebarAction {
         /// Filter mode: "none"/"all" or "session"/"project"
         #[arg(value_name = "MODE")]
         mode: Option<String>,
+    },
+    /// Set sidebar grouping. Toggles between grouped and flat if no mode is
+    /// given.
+    Group {
+        /// Grouping: "none"/"off", "project" or "session"
+        #[arg(value_name = "MODE")]
+        mode: Option<String>,
+        /// Drop the runtime grouping and follow the config file again
+        #[arg(long, conflicts_with = "mode")]
+        clear: bool,
     },
 }
 
@@ -1251,6 +1261,9 @@ pub fn run() -> Result<()> {
             }
             Some(SidebarAction::Filter { mode }) => {
                 command::sidebar::set_filter_mode(mode.as_deref())
+            }
+            Some(SidebarAction::Group { mode, clear }) => {
+                command::sidebar::set_group_by(mode.as_deref(), clear)
             }
             None => {
                 if session {

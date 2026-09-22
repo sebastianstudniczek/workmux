@@ -21,7 +21,12 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
-## Unreleased
+## v0.1.265 (2026-09-22)
+
+- New! Group the sidebar by project or tmux session and fold away stale agents, off by default. See the [sidebar guide](https://workmux.raine.dev/guide/sidebar/#grouping).
+- Sort sidebar agents by attention needed with `sidebar.sort: priority`, placing waiting and done agents first. ([#285](https://github.com/raine/workmux/issues/285), [#289](https://github.com/raine/workmux/pull/289))
+- Show the pull request number beside its check status in the sidebar's default templates. ([#289](https://github.com/raine/workmux/pull/289))
+- Fix terminal resizing making tmux temporarily unresponsive when many windows have sidebars.
 
 ## v0.1.264 (2026-09-21)
 

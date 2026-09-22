@@ -23,12 +23,12 @@ pub(super) fn install_hooks() -> Result<()> {
 
     let sync_cmd = run_shell_hook(&format!("{exe_arg} _sidebar-sync --window #{{window_id}}"));
 
-    // Reflow sidebar layouts in all windows when any window resizes.
-    // This ensures inactive windows get corrected without waiting for the
-    // user to visit them. window-resized fires on terminal resize AND when
-    // switching to an unattached session (window-size=latest resizes windows
-    // to match the new client).
-    let reflow_cmd = run_shell_hook(&format!("{exe_arg} _sidebar-reflow-all"));
+    // Reflow only the window named by the hook. A terminal resize emits one
+    // window-resized event per affected window, so reflowing every window for
+    // every event multiplies the work quadratically.
+    let reflow_cmd = run_shell_hook(&format!(
+        "{exe_arg} _sidebar-reflow --window #{{window_id}}"
+    ));
 
     // Dirty signal: send SIGUSR1 to daemon on window/session/pane changes
     let dirty_cmd = "run-shell -b 'kill -USR1 $(tmux show-option -gqv @workmux_sidebar_daemon_pid) 2>/dev/null || true'";
@@ -88,11 +88,13 @@ mod tests {
     #[test]
     fn run_shell_hook_preserves_shell_quoted_executable() {
         let exe_arg = shell_quote("/tmp/work mux/workmux");
-        let command = run_shell_hook(&format!("{exe_arg} _sidebar-reflow-all"));
+        let command = run_shell_hook(&format!(
+            "{exe_arg} _sidebar-reflow --window #{{window_id}}"
+        ));
 
         assert_eq!(
             command,
-            "run-shell -b \"'/tmp/work mux/workmux' _sidebar-reflow-all\""
+            "run-shell -b \"'/tmp/work mux/workmux' _sidebar-reflow --window #{window_id}\""
         );
     }
 

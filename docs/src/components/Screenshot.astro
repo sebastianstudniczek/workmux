@@ -7,6 +7,7 @@ interface Props {
   alt: string;
   title?: string;
   callout?: string;
+  caption?: string;
   framed?: boolean;
   shadow?: boolean;
 }
@@ -16,6 +17,7 @@ const {
   alt,
   title = 'Terminal',
   callout,
+  caption,
   framed = true,
   shadow = false,
 } = Astro.props;
@@ -44,6 +46,7 @@ const {
     />
     {callout && <span class="callout">{callout}</span>}
   </div>
+  {caption && <figcaption>{caption}</figcaption>}
 </figure>
 
 <style>
@@ -51,6 +54,17 @@ const {
     margin: 1.5rem 0;
     overflow: hidden;
     border-radius: 0.625rem;
+  }
+
+  /* Starlight spaces adjacent content siblings by 1rem, which would push the
+     caption away from the image it belongs to. */
+  .screenshot figcaption {
+    margin-top: 0;
+    padding-top: 0.5rem;
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-sm);
+    line-height: 1.5;
+    text-align: center;
   }
 
   .screenshot.framed {
