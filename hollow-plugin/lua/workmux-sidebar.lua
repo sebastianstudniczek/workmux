@@ -2,6 +2,13 @@
 -- Hollow sidebar plugin showing workmux agent statuses, modelled on the tmux
 -- sidebar (`workmux sidebar`).
 --
+-- Hollow itself is a native Windows app, but workmux only runs inside WSL, so
+-- every bit of data this widget needs (agent state files, git diff stats)
+-- lives on the Linux side. Rather than crossing the WSL/Windows boundary once
+-- per file, each refresh shells out ONCE per concern through
+-- `hollow.term.run_domain_process`, using `jq` to read and flatten
+-- everything in that one call.
+--
 -- Each agent renders as a 2-3 line tile:
 --
 --   ⠹⠸ feature-auth                      12m
@@ -18,13 +25,13 @@
 -- Optional config (pass as opts to setup):
 --   require("workmux-sidebar").setup({
 --     width = 34, side = "left",
+--     domain = "UbuntuWSL",               -- WSL domain to run in;
+--                                          -- nil uses hollow's default domain
 --     spinner = true, spinner_ms = 120,   -- animate working agents
 --     git = true, git_refresh_secs = 10,  -- diff stats, per-worktree poll
 --     untracked = true,                   -- count untracked lines as adds
 --     show_title = true,                  -- third line with the pane title
 --     stale_after = 3600,                 -- seconds before an agent dims out
---     timer = function(ms, fn) ... end,   -- scheduler, if autodetect fails
---     redraw = function() ... end,        -- repaint hook, ditto
 --   })
 --
 -- Default keybindings (override with hollow.keymap.set):
@@ -46,19 +53,17 @@ local ui     = hollow.ui
 local cfg = {
   width                  = 34,
   side                   = "left",
+  domain                 = nil,  -- nil = hollow's configured default domain
   stale_after            = 3600, -- matches the tmux sidebar's stale threshold
   spinner                = true,
   spinner_ms             = 120,
-  reload_secs            = 2,    -- re-read agent state files from disk
+  reload_secs            = 2,    -- re-list+parse agent state files
   git                    = true,
   git_refresh_secs       = 10,
   git_worktrees_per_tick = 1,    -- bound the git work done in one tick
   untracked              = true,
-  untracked_file_limit   = 200,
   untracked_byte_limit   = 1024 * 1024,
   show_title             = true,
-  timer                  = nil,
-  redraw                 = nil,
 }
 
 -- ── Palette ───────────────────────────────────────────────────────────────────
@@ -88,32 +93,28 @@ local SPINNER_FRAMES = {
 }
 
 local STATUS_ICONS = { waiting = "◆ ", done = "✔ " }
-local IDLE_ICON    = "· "
-local STALE_ICON   = "◦ "
-local DIFF_ICON    = "±"
+local IDLE_ICON     = "· "
+local STALE_ICON    = "◦ "
+local DIFF_ICON      = "±"
+local REBASE_ICON    = "⟲ "
 
 -- ── Module state ──────────────────────────────────────────────────────────────
 
 -- pane_id (string) → { icon, ts } from live HTP emits (supersedes disk data)
 local live_cache     = {}
--- sorted list of agent tables (from disk + live overlay)
+-- sorted list of agent tables
 local agents         = {}
 -- 1-based index of the "selected" agent (follows current workspace)
 local cursor         = 1
 -- sidebar widget handle
 local sidebar_widget = nil
--- workdir → { stats = {...}, base, base_for, fetched_at }
+-- workdir → { stats = {...}, fetched_at }
 local git_cache      = {}
 local spinner_frame  = 1
 local last_load      = 0
-local timer_handle   = nil
+local ticking        = false
 
 -- ── Small utilities ───────────────────────────────────────────────────────────
-
-local function trim(s)
-  s = tostring(s or "")
-  return (s:gsub("^%s*(.-)%s*$", "%1"))
-end
 
 -- Display width in code points; wide glyphs count as one, which is close
 -- enough for the short labels and counters rendered here.
@@ -128,7 +129,6 @@ local function trunc(s, max)
   if max <= 0 then return "" end
   if dwidth(s) <= max then return s end
   local out, n = {}, 0
-  -- one UTF-8 sequence at a time (no %z: it is gone in Lua 5.2+)
   for ch in s:gmatch("[\1-\127\194-\244][\128-\191]*") do
     if n >= max - 1 then break end
     out[#out + 1] = ch
@@ -155,26 +155,14 @@ local function format_elapsed(ts)
   end
 end
 
--- Call each candidate until one doesn't raise; used to probe optional hollow APIs.
-local function first_ok(candidates)
-  for _, fn in ipairs(candidates) do
-    local ok, res = pcall(fn)
-    if ok then return res == nil and true or res end
-  end
-  return nil
+-- POSIX single-quote for interpolating a path into the bash script we hand
+-- to run_domain_process (the script's other values all come from inside the
+-- WSL shell itself, so this is the only place we need to escape anything).
+local function quote(s)
+  return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
 end
 
--- ── Paths ─────────────────────────────────────────────────────────────────────
-
-local function agents_dir()
-  local xdg = os.getenv("XDG_STATE_HOME")
-  if xdg and xdg ~= "" then
-    return xdg .. "/workmux/agents"
-  end
-  local home = os.getenv("HOME")
-  if not home then return nil end
-  return home .. "/.local/state/workmux/agents"
-end
+-- ── Path derivation (pure string/path work, no I/O) ──────────────────────────
 
 local function path_parts(p)
   local parts = {}
@@ -222,200 +210,50 @@ local function resolve_labels(agent, stats)
   return worktree, project
 end
 
--- ── File helpers ──────────────────────────────────────────────────────────────
+-- ── WSL process runner ────────────────────────────────────────────────────────
 
-local function list_hollow_agent_files(dir)
-  if not dir then return {} end
-  local files = {}
-  local f = io.popen('ls -1 "' .. dir .. '"/hollow__*.json 2>/dev/null', "r")
-  if not f then return files end
-  for line in f:lines() do
-    local name = line:match("^%s*(.-)%s*$")
-    if name and name ~= "" then
-      files[#files + 1] = name
-    end
-  end
-  pcall(function() f:close() end)
-  return files
+-- Run a bash script inside the configured WSL domain in one shot. Returns
+-- (true, stdout) unless the call itself failed to run at all (missing
+-- domain, wsl.exe not found, etc). A script line that errors on one input
+-- (e.g. jq hitting one corrupt agent file among many) still exits non-zero
+-- overall, so the process "ok" flag is deliberately ignored here — callers
+-- work off the shape of stdout, not the exit code.
+local function run_bash(script)
+  local ok, _ran, stdout = pcall(hollow.term.run_domain_process, { "bash", "-lc", script }, cfg.domain)
+  if not ok then return false, "" end
+  return true, tostring(stdout or "")
 end
 
-local function read_file(path)
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local content = f:read("*a")
-  f:close()
-  return content
-end
-
--- ── Git stats ─────────────────────────────────────────────────────────────────
-
-local function quote(s)
-  s = tostring(s or "")
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
-
-local function capture(cmd)
-  local f = io.popen(cmd, "r")
-  if not f then return nil end
-  local ok, out = pcall(function() return f:read("*a") end)
-  pcall(function() f:close() end)
-  return ok and out or nil
-end
-
-local function git_cmd(dir, ...)
-  local parts = { "git", "--no-optional-locks", "-C", quote(dir) }
-  for _, arg in ipairs({ ... }) do parts[#parts + 1] = arg end
-  parts[#parts + 1] = "2>/dev/null"
-  return table.concat(parts, " ")
-end
-
-local function parse_numstat(text)
-  local added, removed = 0, 0
+-- The last line looking like a JSON object, ignoring any shell/profile noise
+-- a login shell might print ahead of it.
+local function last_json_object(text)
+  local found
   for line in tostring(text or ""):gmatch("[^\r\n]+") do
-    -- <added>\t<removed>\t<path>; binary files use "-" and parse as 0
-    local a, r = line:match("^(%S+)%s+(%S+)%s")
-    added   = added + (tonumber(a) or 0)
-    removed = removed + (tonumber(r) or 0)
+    if line:match("^%s*{") then found = line end
   end
-  return added, removed
-end
-
-local function parse_porcelain(text)
-  local branch, ahead, behind, dirty = nil, 0, 0, false
-  for line in tostring(text or ""):gmatch("[^\r\n]+") do
-    local head = line:match("^# branch%.head (.+)$")
-    if head then branch = trim(head) end
-    local ab = line:match("^# branch%.ab (.+)$")
-    if ab then
-      local a, b = ab:match("^%+(%d+)%s+%-(%d+)")
-      ahead, behind = tonumber(a) or 0, tonumber(b) or 0
-    end
-    if line:sub(1, 1) ~= "#" and trim(line) ~= "" then dirty = true end
-  end
-  if branch == "(detached)" then branch = nil end
-  return branch, ahead, behind, dirty
-end
-
--- Same precedence as workmux: branch.<name>.workmux-base, then origin/HEAD,
--- then main/master.
-local function resolve_base(dir, branch)
-  local configured = trim(capture(git_cmd(
-    dir, "config", "--local", "--get", quote("branch." .. branch .. ".workmux-base"))))
-  if configured ~= "" then return configured end
-
-  local head = trim(capture(git_cmd(dir, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")))
-  local default_branch = head:match("^refs/remotes/origin/(.+)$")
-  if default_branch then return trim(default_branch) end
-
-  for _, candidate in ipairs({ "main", "master" }) do
-    if trim(capture(git_cmd(dir, "rev-parse", "--verify", "--quiet", candidate))) ~= "" then
-      return candidate
-    end
-  end
-  return "main"
-end
-
-local function count_lines(path, byte_limit)
-  local f = io.open(path, "rb")
-  if not f then return 0 end
-  local lines, read = 0, 0
-  while read < byte_limit do
-    local chunk = f:read(64 * 1024)
-    if not chunk then break end
-    read = read + #chunk
-    local _, n = chunk:gsub("\n", "")
-    lines = lines + n
-  end
-  f:close()
-  return lines
-end
-
--- Untracked files count as added lines, the way `workmux sidebar` counts them.
-local function count_untracked_lines(dir)
-  local listing = capture(git_cmd(
-    dir, "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard")) or ""
-  local total, seen = 0, 0
-  for rel in listing:gmatch("[^\r\n]+") do
-    seen = seen + 1
-    if seen > cfg.untracked_file_limit then break end
-    -- git quotes paths containing newlines; skip those rather than mis-join them
-    if rel:sub(1, 1) ~= '"' then
-      total = total + count_lines(dir .. "/" .. rel, cfg.untracked_byte_limit)
-    end
-  end
-  return total
-end
-
--- Refresh one worktree's diff stats. This blocks, so callers keep it off the
--- render path and bound it to a couple of worktrees per tick.
-local function refresh_git(dir)
-  local entry = git_cache[dir] or {}
-  entry.fetched_at = os.time()
-  git_cache[dir] = entry
-
-  local status_out = capture(git_cmd(dir, "status", "--porcelain=v2", "--branch"))
-  if not status_out or trim(status_out) == "" then
-    entry.stats = nil
-    return
-  end
-
-  local branch, ahead, behind, dirty = parse_porcelain(status_out)
-  if entry.base_for ~= branch then
-    entry.base     = branch and resolve_base(dir, branch) or nil
-    entry.base_for = branch
-  end
-
-  local added, removed = 0, 0
-  if branch and entry.base and branch ~= entry.base then
-    added, removed = parse_numstat(capture(git_cmd(
-      dir, "diff", "--no-ext-diff", "--no-textconv", "--numstat",
-      quote(entry.base .. "...HEAD"))))
-  end
-
-  local unc_added, unc_removed = parse_numstat(capture(git_cmd(
-    dir, "diff", "--no-ext-diff", "--no-textconv", "--numstat", "HEAD")))
-  if cfg.untracked then
-    unc_added = unc_added + count_untracked_lines(dir)
-  end
-
-  entry.stats = {
-    branch              = branch,
-    ahead               = ahead,
-    behind              = behind,
-    dirty               = dirty,
-    added               = added,
-    removed             = removed,
-    uncommitted_added   = unc_added,
-    uncommitted_removed = unc_removed,
-  }
-end
-
-local function stats_for(agent)
-  if not cfg.git then return nil end
-  local entry = agent.workdir and git_cache[agent.workdir]
-  return entry and entry.stats or nil
-end
-
--- Refresh worktrees whose stats have aged out; true if anything changed.
-local function refresh_due_git(now)
-  if not cfg.git then return false end
-  local refreshed, seen = 0, {}
-  for _, agent in ipairs(agents) do
-    if refreshed >= cfg.git_worktrees_per_tick then break end
-    local dir = agent.workdir
-    if dir and dir ~= "" and not seen[dir] then
-      seen[dir] = true
-      local entry = git_cache[dir]
-      if not entry or (now - (entry.fetched_at or 0)) >= cfg.git_refresh_secs then
-        refresh_git(dir)
-        refreshed = refreshed + 1
-      end
-    end
-  end
-  return refreshed > 0
+  return found
 end
 
 -- ── Agent loading ─────────────────────────────────────────────────────────────
+
+-- One jq call reads every agent state file and projects just the fields this
+-- sidebar needs, printing one compact JSON object per file — so a single
+-- corrupt/half-written file can't break the rest of the batch.
+local AGENTS_SCRIPT = [[
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/workmux/agents"
+jq -c '{
+  pane_id: ((.pane_key.pane_id // .pane_id) | tostring),
+  workdir: .workdir,
+  status: .status,
+  status_ts: .status_ts,
+  activity_ts: .activity_ts,
+  updated_ts: .updated_ts,
+  pane_title: .pane_title,
+  window_name: .window_name,
+  session: (.session_name // .session),
+  agent_kind: .agent_kind
+}' -- "$dir"/hollow__*.json 2>/dev/null
+]]
 
 local function activity_ts(agent)
   return agent.live_ts or agent.activity_ts or agent.status_ts or agent.updated_ts or 0
@@ -426,49 +264,41 @@ local function is_stale(agent, now)
   return ts > 0 and (now - ts) > cfg.stale_after
 end
 
-local function load_agents()
-  local files  = list_hollow_agent_files(agents_dir())
-  local result = {}
+-- A successful listing is authoritative: an agent whose state file is gone
+-- (pane closed, agent exited) must drop out here, not linger. A failed WSL
+-- call never reaches this function at all (see load_agents), so there is no
+-- need to merge with the previous list "just in case".
+local function apply_agents(result)
+  local result_list = {}
 
-  for _, path in ipairs(files) do
-    local content = read_file(path)
-    -- a half-written state file is normal: skip it and pick it up next tick
-    local ok, data = pcall(hollow.json.decode, content or "")
-    if ok and type(data) == "table" then
-      -- workmux writes AgentState, where the pane id lives under pane_key
-      local pane_key = type(data.pane_key) == "table" and data.pane_key or {}
-      local pane_id  = pane_key.pane_id or data.pane_id
-      if pane_id ~= nil then
-        pane_id = tostring(pane_id)
-        local live = live_cache[pane_id]
-        result[#result + 1] = {
-          pane_id     = pane_id,
-          workdir     = data.workdir,
-          status      = data.status,
-          status_ts   = data.status_ts,
-          activity_ts = data.activity_ts,
-          updated_ts  = data.updated_ts,
-          pane_title  = data.pane_title,
-          window_name = data.window_name,
-          session     = data.session_name or data.session,
-          agent_kind  = data.agent_kind,
-          live_icon   = live and live.icon or nil,
-          live_ts     = live and live.ts or nil,
-        }
+  for line in result:gmatch("[^\r\n]+") do
+    if line:match("^%s*{") then
+      local ok, data = pcall(hollow.json.decode, line)
+      if ok and type(data) == "table" and data.pane_id and data.pane_id ~= "" then
+        local live = live_cache[data.pane_id]
+        data.live_icon = live and live.icon or nil
+        data.live_ts   = live and live.ts or nil
+        result_list[#result_list + 1] = data
       end
     end
   end
 
   -- most recently active first; pane_id breaks ties so the order stays stable
-  table.sort(result, function(a, b)
+  table.sort(result_list, function(a, b)
     local ta, tb = activity_ts(a), activity_ts(b)
     if ta ~= tb then return ta > tb end
     return a.pane_id < b.pane_id
   end)
 
-  agents    = result
+  agents = result_list
+  cursor = math.max(1, math.min(cursor, math.max(1, #agents)))
+end
+
+local function load_agents()
   last_load = os.time()
-  cursor    = math.max(1, math.min(cursor, math.max(1, #agents)))
+  local ok, stdout = run_bash(AGENTS_SCRIPT)
+  if not ok then return end
+  apply_agents(stdout)
 end
 
 -- Sync cursor to the agent matching the given workspace name.
@@ -519,6 +349,127 @@ local function select_prev()
   jump_to_agent(agents[cursor])
 end
 
+-- ── Git stats ─────────────────────────────────────────────────────────────────
+
+-- Everything for one worktree in a single call: branch/ahead/behind/dirty,
+-- rebase-in-progress, base-branch resolution (same precedence as workmux:
+-- branch.<name>.workmux-base, then origin/HEAD, then main/master), committed
+-- diff vs base, uncommitted diff vs HEAD, and untracked lines (counted as
+-- added, capped at untracked_byte_limit bytes of file content).
+local GIT_SCRIPT_BODY = [[
+cd %s 2>/dev/null || { echo '{}'; exit 0; }
+status_out=$(git --no-optional-locks status --porcelain=v2 --branch 2>/dev/null)
+if [ -z "$status_out" ]; then echo '{}'; exit 0; fi
+
+branch=$(printf '%%s\n' "$status_out" | sed -n 's/^# branch\.head //p')
+[ "$branch" = "(detached)" ] && branch=""
+ab_line=$(printf '%%s\n' "$status_out" | sed -n 's/^# branch\.ab //p')
+ahead=$(printf '%%s\n' "$ab_line" | sed -n 's/^+\([0-9]*\).*/\1/p'); ahead=${ahead:-0}
+behind=$(printf '%%s\n' "$ab_line" | sed -n 's/.*-\([0-9]*\)$/\1/p'); behind=${behind:-0}
+dirty=false
+printf '%%s\n' "$status_out" | grep -qv '^#' && dirty=true
+
+rebasing=false
+rb=$(git rev-parse --git-path rebase-merge 2>/dev/null)
+[ -n "$rb" ] && [ -d "$rb" ] && rebasing=true
+if ! $rebasing; then
+  rb=$(git rev-parse --git-path rebase-apply 2>/dev/null)
+  [ -n "$rb" ] && [ -d "$rb" ] && rebasing=true
+fi
+
+added=0; removed=0
+if [ -n "$branch" ]; then
+  base=$(git config --local --get "branch.$branch.workmux-base" 2>/dev/null)
+  if [ -z "$base" ]; then
+    head_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)
+    base=${head_ref#refs/remotes/origin/}
+    [ "$base" = "$head_ref" ] && base=""
+  fi
+  if [ -z "$base" ]; then
+    for candidate in main master; do
+      if git rev-parse --verify --quiet "$candidate" >/dev/null 2>&1; then base="$candidate"; break; fi
+    done
+  fi
+  [ -z "$base" ] && base="main"
+  if [ "$branch" != "$base" ]; then
+    read -r added removed <<<"$(git diff --no-ext-diff --no-textconv --numstat "$base...HEAD" 2>/dev/null | awk '{a+=$1; r+=$2} END{print a+0, r+0}')"
+  fi
+fi
+
+read -r unc_added unc_removed <<<"$(git diff --no-ext-diff --no-textconv --numstat HEAD 2>/dev/null | awk '{a+=$1; r+=$2} END{print a+0, r+0}')"
+untracked=$(git ls-files -z --others --exclude-standard 2>/dev/null | xargs -0 -r cat 2>/dev/null | head -c %d | wc -l)
+unc_added=$((unc_added + untracked))
+
+jq -n --arg branch "$branch" --argjson ahead "$ahead" --argjson behind "$behind" \
+  --argjson dirty "$dirty" --argjson rebasing "$rebasing" \
+  --argjson added "$added" --argjson removed "$removed" \
+  --argjson uadded "$unc_added" --argjson uremoved "$unc_removed" \
+  '{branch: (if $branch == "" then null else $branch end), ahead:$ahead, behind:$behind,
+    dirty:$dirty, rebasing:$rebasing, added:$added, removed:$removed,
+    uncommitted_added:$uadded, uncommitted_removed:$uremoved}'
+]]
+
+local function git_script_for(dir)
+  local untracked_limit = cfg.untracked and cfg.untracked_byte_limit or 0
+  return GIT_SCRIPT_BODY:format(quote(dir), untracked_limit)
+end
+
+local function refresh_git(dir)
+  local entry = git_cache[dir] or {}
+  entry.fetched_at = os.time()
+  git_cache[dir] = entry
+
+  local ok, stdout = run_bash(git_script_for(dir))
+  if not ok then return end
+
+  local line = last_json_object(stdout)
+  if not line then
+    entry.stats = nil
+    return
+  end
+  local decode_ok, data = pcall(hollow.json.decode, line)
+  if not decode_ok or type(data) ~= "table" or data.branch == nil and not next(data) then
+    entry.stats = nil
+    return
+  end
+  entry.stats = {
+    branch               = data.branch,
+    ahead                = data.ahead or 0,
+    behind               = data.behind or 0,
+    dirty                = data.dirty or false,
+    rebasing             = data.rebasing or false,
+    added                = data.added or 0,
+    removed              = data.removed or 0,
+    uncommitted_added    = data.uncommitted_added or 0,
+    uncommitted_removed  = data.uncommitted_removed or 0,
+  }
+end
+
+local function stats_for(agent)
+  if not cfg.git then return nil end
+  local entry = agent.workdir and git_cache[agent.workdir]
+  return entry and entry.stats or nil
+end
+
+-- Refresh worktrees whose stats have aged out; true if anything changed.
+local function refresh_due_git(now)
+  if not cfg.git then return false end
+  local refreshed, seen = 0, {}
+  for _, agent in ipairs(agents) do
+    if refreshed >= cfg.git_worktrees_per_tick then break end
+    local dir = agent.workdir
+    if dir and dir ~= "" and not seen[dir] then
+      seen[dir] = true
+      local entry = git_cache[dir]
+      if not entry or (now - (entry.fetched_at or 0)) >= cfg.git_refresh_secs then
+        refresh_git(dir)
+        refreshed = refreshed + 1
+      end
+    end
+  end
+  return refreshed > 0
+end
+
 -- ── Row pieces ────────────────────────────────────────────────────────────────
 
 local function status_icon(agent, stale)
@@ -550,6 +501,9 @@ local function git_fragments(stats, avail, stale)
     and stats.uncommitted_added == stats.added
     and stats.uncommitted_removed == stats.removed
 
+  if stats.rebasing then
+    committed[#committed + 1] = { REBASE_ICON, C.waiting }
+  end
   if has_committed and not all_uncommitted then
     if stats.added > 0 then
       committed[#committed + 1] = { "+" .. stats.added, C.added_dim }
@@ -593,8 +547,9 @@ end
 local function render(ctx)
   local rows  = {}
   local width = cfg.width
-  if type(ctx) == "table" and type(ctx.width) == "number" and ctx.width > 4 then
-    width = ctx.width
+  if type(ctx) == "table" and type(ctx.size) == "table" and type(ctx.size.cols) == "number"
+      and ctx.size.cols > 4 then
+    width = ctx.size.cols
   end
   local now = os.time()
 
@@ -681,33 +636,8 @@ end
 
 -- ── Scheduling ────────────────────────────────────────────────────────────────
 
--- hollow's timer and repaint entry points differ between versions, so probe a
--- few and let the caller inject its own through opts.timer / opts.redraw.
-local function schedule(interval_ms, fn)
-  if type(cfg.timer) == "function" then
-    local ok, handle = pcall(cfg.timer, interval_ms, fn)
-    if ok then return handle or true end
-  end
-  return first_ok({
-    function() return hollow.timer.interval(interval_ms, fn) end,
-    function() return hollow.timer.every(interval_ms, fn) end,
-    function() return hollow.timer.start(interval_ms, fn) end,
-    function() return hollow.loop.every(interval_ms, fn) end,
-    function() return ui.timer.interval(interval_ms, fn) end,
-  })
-end
-
 local function redraw()
-  if type(cfg.redraw) == "function" then
-    pcall(cfg.redraw)
-    return
-  end
-  first_ok({
-    function() return ui.sidebar.redraw(sidebar_widget) end,
-    function() return sidebar_widget:redraw() end,
-    function() return ui.sidebar.refresh(sidebar_widget) end,
-    function() return ui.redraw() end,
-  })
+  pcall(ui.sidebar.invalidate)
 end
 
 local function any_working()
@@ -717,9 +647,11 @@ local function any_working()
   return false
 end
 
+local tick -- forward declaration; tick reschedules itself via hollow.defer
+
 -- One animation frame: advance the spinner, and at the slower cadences reload
--- agent state from disk and refresh one worktree's git stats.
-local function tick()
+-- agent state and refresh one worktree's git stats.
+tick = function()
   local dirty = false
   local now   = os.time()
 
@@ -736,6 +668,12 @@ local function tick()
   if refresh_due_git(now) then dirty = true end
 
   if dirty then redraw() end
+
+  -- hollow has no repeating-interval API; `defer` is one-shot, so keep the
+  -- animation going by rescheduling ourselves at the end of every frame.
+  if ticking then
+    pcall(hollow.defer, tick, cfg.spinner_ms)
+  end
 end
 
 -- ── HTP handlers ─────────────────────────────────────────────────────────────
@@ -818,12 +756,6 @@ function M.refresh()
   redraw()
 end
 
---- One animation/refresh step. Exposed so a host with its own scheduler can
---- drive the sidebar when `schedule()` finds no hollow timer API.
-function M.tick()
-  tick()
-end
-
 ---@param opts? table see the header comment for the recognised keys
 function M.setup(opts)
   if type(opts) == "table" then
@@ -850,10 +782,9 @@ function M.setup(opts)
   hollow.keymap.default("<C-A-w>", function() ui.sidebar.toggle() end)
   hollow.keymap.default("<C-A-r>", M.refresh)
 
-  -- without a timer the sidebar still works: it refreshes on events and shows
-  -- a static icon instead of the spinner
-  timer_handle = schedule(cfg.spinner_ms, tick)
-  M.has_timer  = timer_handle ~= nil
+  -- kick off the self-rescheduling animation/refresh loop
+  ticking = true
+  pcall(hollow.defer, tick, cfg.spinner_ms)
 end
 
 return M
