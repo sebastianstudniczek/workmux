@@ -7,6 +7,7 @@ pub mod agent;
 pub mod conversation;
 pub mod handle;
 pub mod handshake;
+pub mod hollow;
 pub mod kitty;
 pub mod tmux;
 pub mod types;
@@ -1058,7 +1059,8 @@ pub trait Multiplexer: Send + Sync {
 /// 3. `$WEZTERM_PANE` set → WezTerm
 /// 4. `$ZELLIJ`, `$ZELLIJ_PANE_ID`, or `$ZELLIJ_SESSION_NAME` set → Zellij
 /// 5. `$KITTY_WINDOW_ID` set → Kitty
-/// 6. None → defaults to tmux (for backward compatibility)
+/// 6. `$HOLLOW_PANE_ID` set → Hollow
+/// 7. None → defaults to tmux (for backward compatibility)
 ///
 /// This ordering ensures that running tmux inside kitty (or wezterm) correctly
 /// selects the innermost multiplexer.
@@ -1068,7 +1070,7 @@ pub fn detect_backend() -> BackendType {
             Ok(bt) => return bt,
             Err(_) => {
                 eprintln!(
-                    "workmux: invalid WORKMUX_BACKEND={val:?}, expected tmux|wezterm|kitty|zellij"
+                    "workmux: invalid WORKMUX_BACKEND={val:?}, expected tmux|wezterm|kitty|zellij|hollow"
                 );
             }
         }
@@ -1083,7 +1085,7 @@ pub fn detect_backend_strict() -> Result<BackendType> {
         && !value.trim().is_empty()
     {
         return value.parse().map_err(|_| {
-            anyhow!("invalid WORKMUX_BACKEND={value:?}, expected tmux|wezterm|kitty|zellij")
+            anyhow!("invalid WORKMUX_BACKEND={value:?}, expected tmux|wezterm|kitty|zellij|hollow")
         });
     }
 
@@ -1098,11 +1100,12 @@ fn detect_backend_from_environment() -> BackendType {
             || std::env::var("ZELLIJ_PANE_ID").is_ok()
             || std::env::var("ZELLIJ_SESSION_NAME").is_ok(),
         std::env::var("KITTY_WINDOW_ID").is_ok(),
+        std::env::var("HOLLOW_PANE_ID").is_ok(),
     )
 }
 
 /// Pure auto-detection logic, separated for testability.
-fn resolve_backend(tmux: bool, wezterm: bool, zellij: bool, kitty: bool) -> BackendType {
+fn resolve_backend(tmux: bool, wezterm: bool, zellij: bool, kitty: bool, hollow: bool) -> BackendType {
     if tmux {
         return BackendType::Tmux;
     }
@@ -1119,6 +1122,10 @@ fn resolve_backend(tmux: bool, wezterm: bool, zellij: bool, kitty: bool) -> Back
         return BackendType::Kitty;
     }
 
+    if hollow {
+        return BackendType::Hollow;
+    }
+
     BackendType::Tmux
 }
 
@@ -1129,6 +1136,7 @@ pub fn create_backend(backend_type: BackendType) -> Arc<dyn Multiplexer> {
         BackendType::WezTerm => Arc::new(wezterm::WezTermBackend::new()),
         BackendType::Kitty => Arc::new(kitty::KittyBackend::new()),
         BackendType::Zellij => Arc::new(zellij::ZellijBackend::new()),
+        BackendType::Hollow => Arc::new(hollow::HollowBackend::new()),
     }
 }
 

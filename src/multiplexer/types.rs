@@ -304,6 +304,8 @@ pub enum BackendType {
     Kitty,
     /// Zellij backend
     Zellij,
+    /// Hollow terminal backend
+    Hollow,
 }
 
 impl std::fmt::Display for BackendType {
@@ -313,6 +315,7 @@ impl std::fmt::Display for BackendType {
             BackendType::WezTerm => write!(f, "wezterm"),
             BackendType::Kitty => write!(f, "kitty"),
             BackendType::Zellij => write!(f, "zellij"),
+            BackendType::Hollow => write!(f, "hollow"),
         }
     }
 }
@@ -326,6 +329,7 @@ impl std::str::FromStr for BackendType {
             "wezterm" => Ok(BackendType::WezTerm),
             "kitty" => Ok(BackendType::Kitty),
             "zellij" => Ok(BackendType::Zellij),
+            "hollow" => Ok(BackendType::Hollow),
             other => Err(format!("unknown backend: {}", other)),
         }
     }
