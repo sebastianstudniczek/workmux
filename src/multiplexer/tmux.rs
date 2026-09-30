@@ -1032,16 +1032,6 @@ impl Multiplexer for TmuxBackend {
         self.tmux_cmd(&["kill-window", "-t", &target_arg])
     }
 
-    fn rename_window(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
-        // `=` prefix forces exact-name match so we don't hit similarly-named windows.
-        let target = format!("={}", old_full_name);
-        self.tmux_cmd(&["rename-window", "-t", &target, new_full_name])
-    }
-
-    fn rename_window_at_pane(&self, pane_id: &str, new_name: &str) -> Result<()> {
-        self.tmux_cmd(&["rename-window", "-t", pane_id, new_name])
-    }
-
     fn rename_session(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
         // `=` prefix forces exact-name match so we don't hit similarly-named sessions.
         let target = format!("={}", old_full_name);

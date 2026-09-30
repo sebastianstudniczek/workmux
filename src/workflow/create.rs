@@ -117,13 +117,13 @@ fn create_impl(
             placement_window_id =
                 setup::resolve_window_placement_target(context.mux.as_ref(), &context.config)?;
         }
-        if options.mode == MuxMode::Session && context.mux.name() != "tmux" {
-            return Err(anyhow!(
-                "Session mode (--mode session / --session) is only supported with tmux.\n\
-                 Current backend: {}. Use window mode instead.",
-                context.mux.name()
-            ));
-        }
+        // if options.mode == MuxMode::Session && context.mux.name() != "tmux" {
+        //     return Err(anyhow!(
+        //         "Session mode (--mode session / --session) is only supported with tmux.\n\
+        //          Current backend: {}. Use window mode instead.",
+        //         context.mux.name()
+        //     ));
+        // }
 
         let requested_target_name = options.primary_mux_target_name(handle);
         let explicit_target_name = options.has_explicit_primary_mux_target();

@@ -77,13 +77,13 @@ pub fn open(
         MuxMode::Session => cli_target_session_name.as_deref(),
     };
 
-    if mode == MuxMode::Session && context.mux.name() != "tmux" {
-        anyhow::bail!(
-            "Session mode (--mode session / --session) is only supported with tmux.\n\
-             Current backend: {}. Use window mode instead.",
-            context.mux.name()
-        );
-    }
+    // if mode == MuxMode::Session && context.mux.name() != "tmux" {
+    //     anyhow::bail!(
+    //         "Session mode (--mode session / --session) is only supported with tmux.\n\
+    //          Current backend: {}. Use window mode instead.",
+    //         context.mux.name()
+    //     );
+    // }
 
     // Validate windows config requires session mode (after canonical mode resolution)
     if let Some(windows) = &context.config.windows {
