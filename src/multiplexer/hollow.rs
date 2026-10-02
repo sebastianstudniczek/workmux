@@ -72,11 +72,6 @@ struct HollowWorkspace {
     tabs: Vec<HollowTab>,
 }
 
-/// POSIX single-quote a value for interpolation into a `sh -c` command string.
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct HollowBackend;
@@ -176,20 +171,11 @@ impl HollowBackend {
 
     /// Create a new tab in whichever workspace is currently active and
     /// return the pane ID of its initial pane.
-    ///
-    /// TODO(hollow): `hollow-cli tab new` has no `--cwd` flag (unlike
-    /// `pane split`). Working around it by `cd`-ing as the tab's startup
-    /// command; drop this once hollow grows native `--cwd` support for
-    /// `tab new` and pass it directly instead.
     fn create_tab_in_current_workspace(&self, cwd: &Path, name: Option<&str>) -> Result<String> {
         let cwd_str = cwd.to_string_lossy();
-        let startup_cmd = format!(
-            "cd {} && exec \"$SHELL\"",
-            shell_single_quote(&cwd_str)
-        );
 
         self.hollow_cmd()
-            .args(&["tab", "new", "--cmd", &startup_cmd])
+            .args(&["tab", "new", "--cwd", &cwd_str])
             .run()
             .context("Failed to create hollow tab")?;
 
@@ -441,8 +427,22 @@ impl Multiplexer for HollowBackend {
     // === Pane Management ===
 
     fn select_pane(&self, pane_id: &str) -> Result<()> {
-        // Hollow has no direct "focus pane by ID" CLI verb. Zoom is the closest
-        // approximation (it brings the pane into view and gives it focus).
+        // Hollow has no "focus pane by ID" CLI verb. The hollow-workmux plugin
+        // answers the `workmux:focus` HTP query with `true` after focusing the
+        // pane (switching workspace and tab as needed). `get htp` exits 0 even
+        // for an unknown channel, so success is judged by the payload alone.
+        let params = serde_json::json!({ "pane_id": pane_id }).to_string();
+        let focused = self
+            .hollow_cmd()
+            .args(&["get", "htp", "workmux:focus", &params])
+            .run_and_capture_stdout()
+            .is_ok_and(|out| out.trim() == "true");
+        if focused {
+            return Ok(());
+        }
+
+        // Without the plugin, zoom is the closest approximation (it brings the
+        // pane into view and gives it focus).
         self.hollow_cmd()
             .args(&["pane", "zoom", "--id", pane_id])
             .run()
@@ -466,9 +466,18 @@ impl Multiplexer for HollowBackend {
         // Hollow has no native respawn. Strategy:
         //   1. Find the tab that contains this pane.
         //   2. If the pane has siblings → close it, split from a sibling.
-        //   3. If the pane is alone in its tab → create a new tab, close the old pane.
+        //   3. If the pane is alone in its tab → split beside it, close the old pane.
+        //
+        // Both paths split rather than open a new tab, so the replacement stays
+        // in the original tab and keeps the window name workmux assigned to it.
+        //
+        // `pane split` acts on the ACTIVE pane — hollow-cli has no way to
+        // target one by ID — so this assumes the pane being respawned is
+        // active, which holds for the `setup_panes` flow that drives it.
         let tabs = self.list_tabs()?;
-        let pane_id_num: u64 = pane_id.parse().unwrap_or(0);
+        let pane_id_num: u64 = pane_id
+            .parse()
+            .with_context(|| format!("Invalid hollow pane ID '{}'", pane_id))?;
         let cwd_str = cwd.to_string_lossy();
 
         let containing_tab = tabs
@@ -487,11 +496,9 @@ impl Multiplexer for HollowBackend {
 
                 // Split the now-active sibling pane horizontally.
                 let mut args: Vec<&str> = vec!["pane", "split", "horizontal", "--cwd", &cwd_str];
-                let cmd_owned;
                 if let Some(c) = cmd {
-                    cmd_owned = c.to_string();
                     args.push("--cmd");
-                    args.push(&cmd_owned);
+                    args.push(c);
                 }
                 self.hollow_cmd()
                     .args(&args)
@@ -503,28 +510,27 @@ impl Multiplexer for HollowBackend {
                     .ok_or_else(|| anyhow!("No active pane after respawn split"));
             }
 
-            // Pane is alone in its tab: create a new tab, close the old one.
-            let tab_id = tab.id.to_string();
-            let mut args: Vec<&str> = vec!["tab", "new", "--cwd", &cwd_str];
-            let cmd_owned;
+            // Alone in its tab: split to place the replacement beside it, then
+            // close the original so the replacement is left holding the tab.
+            let mut args: Vec<&str> = vec!["pane", "split", "horizontal", "--cwd", &cwd_str];
             if let Some(c) = cmd {
-                cmd_owned = c.to_string();
                 args.push("--cmd");
-                args.push(&cmd_owned);
+                args.push(c);
             }
             self.hollow_cmd()
                 .args(&args)
                 .run()
-                .context("Failed to create hollow tab for respawn")?;
+                .context("Failed to split hollow pane for respawn")?;
 
             let new_pane_id = self
                 .query_current_pane_id()?
-                .ok_or_else(|| anyhow!("No active pane after creating tab for respawn"))?;
+                .ok_or_else(|| anyhow!("No active pane after respawn split"))?;
 
-            // Close the old (now-empty-pane) tab.
+            // Best-effort: the replacement already exists, so a failure here
+            // leaves a stray pane rather than losing the respawned one.
             let _ = self
                 .hollow_cmd()
-                .args(&["tab", "close", "--id", &tab_id])
+                .args(&["pane", "close", "--id", pane_id])
                 .run();
 
             return Ok(new_pane_id);
@@ -532,11 +538,9 @@ impl Multiplexer for HollowBackend {
 
         // No matching tab found; fall back to creating a new tab.
         let mut args: Vec<&str> = vec!["tab", "new", "--cwd", &cwd_str];
-        let cmd_owned;
         if let Some(c) = cmd {
-            cmd_owned = c.to_string();
             args.push("--cmd");
-            args.push(&cmd_owned);
+            args.push(c);
         }
         self.hollow_cmd()
             .args(&args)
