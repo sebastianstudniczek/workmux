@@ -9,7 +9,7 @@ use ratatui::style::{Modifier, Style};
 use crate::ui::theme::ThemePalette;
 
 use super::TokenId;
-use super::context::display_width;
+use crate::util::display_width;
 
 /// A row the layout solver can render.
 ///

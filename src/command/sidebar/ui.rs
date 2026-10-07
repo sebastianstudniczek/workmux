@@ -23,6 +23,7 @@ use super::template::layout::{
 };
 use super::template::parser::Token;
 use super::template::row::{GroupStatusCount, HeaderContext};
+use crate::util::display_width;
 
 /// Compute pane suffixes like " (1)", " (2)" for agents sharing the same window.
 fn compute_pane_suffixes(agents: &[AgentPane]) -> Vec<String> {
@@ -510,7 +511,16 @@ pub fn render_sidebar(f: &mut Frame, app: &mut SidebarApp) {
 /// on groups are listed while grouping is on, since that is the only time they
 /// have anything to act on.
 fn help_entries(app: &SidebarApp) -> Vec<(&'static str, &'static str)> {
-    let mut entries = vec![("j k", "move"), ("g G", "first last"), ("enter", "jump")];
+    let enter_label = match app.enter_action {
+        crate::config::SidebarEnterAction::Focus => "focus pane",
+        crate::config::SidebarEnterAction::Select => "show window",
+    };
+    let mut entries = vec![
+        ("j k", "move"),
+        ("g G", "first last"),
+        ("enter", enter_label),
+        ("o", "focus pane"),
+    ];
     if app.group_by.is_some() {
         entries.extend([
             ("h l", "fold unfold"),
@@ -1762,13 +1772,6 @@ fn no_agents_line(app: &SidebarApp) -> Line<'static> {
     }
 }
 
-/// Get the display width of a string, counting wide chars as 2.
-pub(crate) fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
@@ -1777,6 +1780,19 @@ mod tests {
     use super::*;
     use crate::agent_display::{sanitize_pane_title, strip_oc_title_prefix};
     use crate::command::sidebar::app::TemplateError;
+
+    #[test]
+    fn help_describes_enter_action_and_explicit_focus_key() {
+        let mut app = SidebarApp::test_with_template_error(TemplateError {
+            location: String::new(),
+            message: String::new(),
+        });
+        assert!(help_entries(&app).contains(&("enter", "focus pane")));
+        assert!(help_entries(&app).contains(&("o", "focus pane")));
+
+        app.enter_action = crate::config::SidebarEnterAction::Select;
+        assert!(help_entries(&app).contains(&("enter", "show window")));
+    }
 
     fn tile_fixture() -> SidebarApp {
         use super::super::template::parser::parse_line;
@@ -1817,6 +1833,7 @@ mod tests {
                 window_cmd: None,
                 agent_command: None,
                 agent_kind: None,
+                prompt: None,
             });
         }
         app.rebuild_rows();
@@ -2243,6 +2260,7 @@ mod tests {
                 window_cmd: None,
                 agent_command: Some("claude".to_string()),
                 agent_kind: Some("claude".to_string()),
+                prompt: None,
             })
             .collect();
         app.rebuild_rows();

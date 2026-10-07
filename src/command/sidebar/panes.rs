@@ -12,8 +12,10 @@ use super::daemon_ctrl::kill_daemon;
 use super::hooks::remove_hooks;
 use super::layout_tree::{layout_after_sidebar_remove, reflow_after_sidebar_add};
 
-fn parse_window_panes(output: &str) -> (bool, Option<&str>) {
-    let mut has_sidebar = false;
+const PENDING_SELECTION_OPTION: &str = "@workmux_sidebar_pending_selection";
+
+fn parse_window_panes(output: &str) -> (Option<&str>, Option<&str>) {
+    let mut sidebar_pane_id = None;
     let mut first_pane_id = None;
     for line in output.lines() {
         let (pane_id, role) = line.split_once('\t').unwrap_or((line, ""));
@@ -21,9 +23,11 @@ fn parse_window_panes(output: &str) -> (bool, Option<&str>) {
         if first_pane_id.is_none() && !pane_id.is_empty() {
             first_pane_id = Some(pane_id);
         }
-        has_sidebar |= role.trim() == SIDEBAR_ROLE_VALUE;
+        if role.trim() == SIDEBAR_ROLE_VALUE {
+            sidebar_pane_id = Some(pane_id);
+        }
     }
-    (has_sidebar, first_pane_id)
+    (sidebar_pane_id, first_pane_id)
 }
 
 fn query_window_panes(window_id: &str) -> Result<String> {
@@ -38,10 +42,60 @@ fn query_window_panes(window_id: &str) -> Result<String> {
         .run_and_capture_stdout()
 }
 
+/// Find the sidebar pane in a window, if one exists.
+pub(super) fn find_sidebar_pane_in_window(window_id: &str) -> Result<Option<String>> {
+    let output = query_window_panes(window_id)?;
+    Ok(parse_window_panes(&output).0.map(str::to_string))
+}
+
 /// Check if a window already has a sidebar pane.
 pub(super) fn find_sidebar_in_window(window_id: &str) -> Result<bool> {
-    let output = query_window_panes(window_id)?;
-    Ok(parse_window_panes(&output).0)
+    Ok(find_sidebar_pane_in_window(window_id)?.is_some())
+}
+
+/// Leave an agent selection for a sidebar process before switching to it.
+pub(super) fn set_pending_selection(sidebar_pane_id: &str, agent_pane_id: &str) -> Result<()> {
+    Cmd::new("tmux")
+        .args(&[
+            "set-option",
+            "-p",
+            "-t",
+            sidebar_pane_id,
+            PENDING_SELECTION_OPTION,
+            agent_pane_id,
+        ])
+        .run()
+        .map(|_| ())
+}
+
+pub(super) fn clear_pending_selection(sidebar_pane_id: &str) {
+    let _ = Cmd::new("tmux")
+        .args(&[
+            "set-option",
+            "-pu",
+            "-t",
+            sidebar_pane_id,
+            PENDING_SELECTION_OPTION,
+        ])
+        .run();
+}
+
+/// Take the selection handed off by another sidebar process.
+pub(super) fn take_pending_selection(sidebar_pane_id: &str) -> Option<String> {
+    let selection = Cmd::new("tmux")
+        .args(&[
+            "show-option",
+            "-pqv",
+            "-t",
+            sidebar_pane_id,
+            PENDING_SELECTION_OPTION,
+        ])
+        .run_and_capture_stdout()
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    clear_pending_selection(sidebar_pane_id);
+    selection
 }
 
 /// Create a sidebar pane in a specific window (idempotent).
@@ -52,15 +106,15 @@ pub(super) fn create_sidebar_in_window(
 ) -> Result<()> {
     let panes = query_window_panes(window_id).or_else(|_| query_window_panes(window_id))?;
     let target_pane = match parse_window_panes(&panes) {
-        (true, _) => {
+        (Some(_), _) => {
             debug!(
                 window_id,
                 "create_sidebar_in_window: already exists, skipping"
             );
             return Ok(());
         }
-        (false, Some(target_pane)) => target_pane.to_string(),
-        (false, None) => return Ok(()),
+        (None, Some(target_pane)) => target_pane.to_string(),
+        (None, None) => return Ok(()),
     };
     if target_pane.is_empty() {
         return Ok(());
@@ -411,12 +465,12 @@ mod tests {
     fn window_pane_query_finds_sidebar_and_first_target() {
         let output = "%7\t\n%8\tsidebar\n";
 
-        assert_eq!(parse_window_panes(output), (true, Some("%7")));
+        assert_eq!(parse_window_panes(output), (Some("%8"), Some("%7")));
     }
 
     #[test]
     fn window_pane_query_handles_missing_role_field() {
-        assert_eq!(parse_window_panes("%7\n"), (false, Some("%7")));
-        assert_eq!(parse_window_panes(""), (false, None));
+        assert_eq!(parse_window_panes("%7\n"), (None, Some("%7")));
+        assert_eq!(parse_window_panes(""), (None, None));
     }
 }

@@ -71,13 +71,25 @@ impl ConnectionLimit {
     }
 
     fn try_acquire(self: &Arc<Self>) -> Result<ConnectionPermit, usize> {
-        self.active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
-                (active < self.max).then_some(active + 1)
-            })
-            .map(|_| ConnectionPermit {
-                limit: Arc::clone(self),
-            })
+        let mut active = self.active.load(Ordering::Relaxed);
+        loop {
+            if active >= self.max {
+                return Err(active);
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(ConnectionPermit {
+                        limit: Arc::clone(self),
+                    });
+                }
+                Err(current) => active = current,
+            }
+        }
     }
 
     #[cfg(test)]
@@ -923,6 +935,40 @@ mod tests {
         let response =
             proxy_request_status_line(proxy.port, "CONNECT example.com:443 HTTP/1.1\r\n\r\n");
         assert!(response.contains("407"));
+    }
+
+    #[test]
+    fn connection_limit_rejects_zero_capacity() {
+        let limit = ConnectionLimit::new(0);
+        assert!(matches!(limit.try_acquire(), Err(0)));
+        assert_eq!(limit.active(), 0);
+    }
+
+    #[test]
+    fn connection_limit_is_preserved_under_contention() {
+        let limit = ConnectionLimit::new(4);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let limit = Arc::clone(&limit);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let permit = limit.try_acquire().ok();
+                    barrier.wait();
+                    permit
+                })
+            })
+            .collect();
+        let permits: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(permits.len(), 4);
+        assert_eq!(limit.active(), 4);
+        drop(permits);
+        assert_eq!(limit.active(), 0);
+        assert!(limit.try_acquire().is_ok());
     }
 
     #[test]

@@ -56,6 +56,7 @@ sidebars without a restart.
 | `{window}`       | Tmux window name (blank for generic shell names like `zsh`, `bash`).                                                                            |
 | `{window_index}` | Tmux window number as shown in the status bar (e.g. `3` for `3:wm-fix-auth`), usable with `prefix+N`. Empty on backends without window indexes. |
 | `{pane_title}`   | Sanitized agent task title from the pane title.                                                                                                 |
+| `{prompt}`       | Latest prompt you sent to the agent. Empty until one is captured; see [Prompt column](/guide/dashboard/configuration/#prompt-column).           |
 | `{pane_suffix}`  | Disambiguator like `(1)`, `(2)` when multiple agents share a window. Empty otherwise.                                                           |
 | `{status_icon}`  | Status indicator (working spinner, waiting, done, sleeping, etc.).                                                                              |
 | `{agent_icon}`   | Per-agent icon based on the running agent's profile (see [Agent identity](#agent-identity)).                                                    |
@@ -128,7 +129,7 @@ at column 1 in tiles[0]` until the template is fixed.
 tokens after it form the right segment. The leftmost flex token in the left
 segment absorbs ellipsis-truncation when there isn't enough room. Flex tokens
 are: `{primary}`, `{secondary}`, `{worktree}`, `{project}`, `{session}`,
-`{window}`, `{pane_title}`, `{group}`. Other tokens always render at their natural width.
+`{window}`, `{pane_title}`, `{prompt}`, `{group}`. Other tokens always render at their natural width.
 
 When a line has more slack than the flex token needs, the leftover is emitted as
 spaces between the left and right segments, so right-segment tokens like

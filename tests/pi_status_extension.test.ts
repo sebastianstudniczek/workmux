@@ -1,6 +1,31 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
+import { EventEmitter } from 'node:events';
 
-import workmuxStatusExtension from '../resources/pi/extensions/workmux-status';
+type Spawned = { args: string[]; cwd: string; prompt: string };
+let spawned: Spawned[] = [];
+let spawnResult: number | 'error' | 'throw' = 0;
+let onSpawn: ((spawn: Spawned) => void) | undefined;
+
+mock.module('node:child_process', () => ({
+  spawn(_command: string, args: string[], options: { cwd: string }) {
+    if (spawnResult === 'throw') throw new Error('spawn failed');
+    const child = new EventEmitter() as EventEmitter & { stdin: EventEmitter & { end(data: string): void } };
+    const stdin = new EventEmitter() as EventEmitter & { end(data: string): void };
+    stdin.end = (data: string) => {
+      const record = { args, cwd: options.cwd, prompt: JSON.parse(data).prompt };
+      spawned.push(record);
+      onSpawn?.(record);
+      queueMicrotask(() => {
+        if (spawnResult === 'error') child.emit('error', new Error('ENOENT'));
+        else child.emit('close', spawnResult);
+      });
+    };
+    child.stdin = stdin;
+    return child;
+  },
+}));
+
+const { default: workmuxStatusExtension } = await import('../resources/pi/extensions/workmux-status');
 
 type Handler = (event: unknown, context: unknown) => Promise<void> | void;
 type Listener = (data: unknown) => Promise<void> | void;
@@ -34,6 +59,11 @@ async function createHarness(
   const calls: string[][] = [];
   const statuses: string[] = [];
   let branch = [{ type: 'message', message: initialMessage }];
+  spawned = [];
+  spawnResult = 0;
+  onSpawn = (record) => {
+    if (record.args[0] === 'set-window-status' && spawnResult === 0) statuses.push(record.args[1]);
+  };
   let idle = options.idle ?? true;
   const events = {
     on(name: string, listener: Listener) {
@@ -83,6 +113,9 @@ async function createHarness(
     },
     setMessage(message: AssistantMessage) {
       branch = [...branch, { type: 'message', message }];
+    },
+    async input(text: string, source = 'interactive', cwd = '/project') {
+      await handlers.get('input')?.({ type: 'input', text, source }, { cwd });
     },
     async emit(name: string, isIdle?: boolean) {
       if (name === 'agent_start') idle = false;
@@ -348,5 +381,71 @@ describe('pi workmux status extension', () => {
     expect(harness.listeners.get('suba:activity')!.size).toBe(1);
     await harness.activity(0);
     expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test('sends a submitted prompt with the agent start report', async () => {
+    const harness = await createHarness();
+
+    await harness.input('fix the bug', 'interactive', '/repo/feature');
+    expect(spawned).toEqual([]);
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+
+    expect(spawned).toEqual([
+      { args: ['set-window-status', 'working'], cwd: '/repo/feature', prompt: 'fix the bug' },
+    ]);
+    expect(harness.statuses).toEqual(['working', 'done']);
+  });
+
+  test('sends a steering prompt at once while the agent works', async () => {
+    const harness = await createHarness(stoppedMessage(), { snapshot: 0 });
+
+    await harness.emit('agent_start');
+    await harness.input('also update docs');
+
+    expect(spawned.map((record) => record.prompt)).toEqual(['also update docs']);
+    expect(harness.statuses).toEqual(['done', 'working', 'working']);
+  });
+
+  test('does not report working for a prompt while nothing is active', async () => {
+    const gate = deferred();
+    const harness = await createHarness(stoppedMessage(), {
+      async exec(args) {
+        if (args[1] === 'done') await gate.promise;
+        return 0;
+      },
+    });
+    await harness.activity(1);
+    harness.events.emit('suba:activity', { activeCount: 0 });
+    await harness.input('next task');
+    gate.resolve();
+    await harness.flush();
+
+    expect(harness.statuses).toEqual(['working', 'done']);
+    expect(spawned).toEqual([]);
+  });
+
+  test('ignores extension-sourced and blank input', async () => {
+    const harness = await createHarness();
+
+    await harness.input('injected', 'extension');
+    await harness.input('  ');
+    await harness.emit('agent_start');
+
+    expect(spawned).toEqual([]);
+    expect(harness.statuses).toEqual(['working']);
+  });
+
+  test.each(['error', 'throw', 1] as const)('a %s prompt write does not poison later writes', async (failure) => {
+    const harness = await createHarness(stoppedMessage(), { snapshot: 0 });
+
+    spawnResult = failure;
+    await harness.input('fix the bug');
+    await harness.emit('agent_start');
+    spawnResult = 0;
+    await harness.emit('agent_settled');
+    await harness.activity(1);
+
+    expect(harness.statuses).toEqual(['done', 'done', 'working']);
   });
 });

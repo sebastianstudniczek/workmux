@@ -2,12 +2,20 @@ import { describe, expect, test } from 'bun:test';
 
 import { WorkmuxStatusPlugin } from '../resources/opencode/plugins/workmux-status';
 
-async function createHarness({ failRegistration = false } = {}) {
+async function createHarness({
+  failRegistration = false,
+  sessions = {} as Record<string, { parentID?: string } | Error>,
+} = {}) {
   const statuses: string[] = [];
   const commands: string[] = [];
-  const shell = (strings: TemplateStringsArray, status?: string) => {
+  const prompts: Array<{ status: string; prompt: string }> = [];
+  const lookups: string[] = [];
+  const shell = (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const status = values[0] as string | undefined;
+    const stdin = values.find((value) => value instanceof Response) as Response | undefined;
     const command = strings.reduce(
-      (result, part, index) => result + part + (index < strings.length - 1 ? status : ''),
+      (result, part, index) =>
+        result + part + (index < values.length ? (values[index] === stdin ? '<stdin>' : values[index]) : ''),
       '',
     );
     return {
@@ -19,19 +27,44 @@ async function createHarness({ failRegistration = false } = {}) {
         if (status !== undefined) {
           statuses.push(status);
         }
+        if (stdin && status !== undefined) {
+          prompts.push({ status, prompt: JSON.parse(await stdin.text()).prompt });
+        }
       },
     };
   };
-  const hooks = await WorkmuxStatusPlugin({ $: shell } as never);
+  const client = {
+    session: {
+      get: async ({ path }: { path: { id: string } }) => {
+        lookups.push(path.id);
+        const session = sessions[path.id];
+        if (session instanceof Error) throw session;
+        return { data: session === undefined ? undefined : { id: path.id, ...session } };
+      },
+    },
+  };
+  const hooks = await WorkmuxStatusPlugin({ $: shell, client } as never);
 
   return {
     commands,
     statuses,
+    prompts,
+    lookups,
     emit: async (event: unknown) => {
       await hooks.event?.({ event } as never);
     },
+    message: async (sessionID: string, parts: unknown[]) => {
+      await hooks['chat.message']?.({ sessionID } as never, { message: {}, parts } as never);
+    },
   };
 }
+
+const textPart = (text: string, synthetic?: boolean) => ({ type: 'text', text, synthetic });
+
+const sessionCreated = (id: string, parentID?: string) => ({
+  type: 'session.created',
+  properties: { info: { id, parentID } },
+});
 
 const sessionStatus = (sessionID: string, type: 'busy' | 'idle') => ({
   type: 'session.status',
@@ -220,5 +253,78 @@ describe('WorkmuxStatusPlugin', () => {
       properties: { sessionID: 'child' },
     });
     expect(harness.statuses).toEqual(['working', 'waiting', 'working']);
+  });
+
+  test('sends a submitted prompt with the next working report', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionCreated('parent'));
+    await harness.message('parent', [textPart('fix the'), textPart('bug')]);
+    expect(harness.statuses).toEqual([]);
+
+    await harness.emit(userMessage('parent'));
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit(sessionStatus('parent', 'idle'));
+
+    expect(harness.statuses).toEqual(['working', 'done']);
+    expect(harness.prompts).toEqual([{ status: 'working', prompt: 'fix the\nbug' }]);
+  });
+
+  test('sends a prompt queued while working without a status change', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionCreated('parent'));
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.message('parent', [textPart('also update docs')]);
+
+    expect(harness.statuses).toEqual(['working', 'working']);
+    expect(harness.prompts).toEqual([{ status: 'working', prompt: 'also update docs' }]);
+  });
+
+  test('holds a prompt while waiting until work resumes', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionCreated('parent'));
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.emit({ type: 'permission.asked', properties: { sessionID: 'parent' } });
+    await harness.message('parent', [textPart('yes, go ahead')]);
+    expect(harness.statuses).toEqual(['working', 'waiting']);
+    expect(harness.prompts).toEqual([]);
+
+    await harness.emit({ type: 'permission.replied', properties: { sessionID: 'parent' } });
+    expect(harness.prompts).toEqual([{ status: 'working', prompt: 'yes, go ahead' }]);
+  });
+
+  test('ignores prompts of child sessions and synthetic parts', async () => {
+    const harness = await createHarness();
+
+    await harness.emit(sessionCreated('parent'));
+    await harness.emit(sessionCreated('child', 'parent'));
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.message('child', [textPart('delegated task')]);
+    await harness.message('parent', [textPart('file contents', true)]);
+    await harness.emit(sessionStatus('child', 'busy'));
+
+    expect(harness.statuses).toEqual(['working']);
+    expect(harness.prompts).toEqual([]);
+    expect(harness.lookups).toEqual([]);
+  });
+
+  test('classifies unknown sessions through the client', async () => {
+    const harness = await createHarness({
+      sessions: { parent: {}, child: { parentID: 'parent' }, failing: new Error('offline') },
+    });
+
+    await harness.emit(sessionStatus('parent', 'busy'));
+    await harness.message('child', [textPart('delegated task')]);
+    await harness.message('failing', [textPart('unknown')]);
+    await harness.message('missing', [textPart('unknown')]);
+    expect(harness.prompts).toEqual([]);
+
+    await harness.message('parent', [textPart('top level')]);
+    await harness.message('child', [textPart('cached')]);
+    expect(harness.lookups).toEqual(['child', 'failing', 'missing', 'parent']);
+    expect(harness.prompts).toEqual([{ status: 'working', prompt: 'top level' }]);
   });
 });

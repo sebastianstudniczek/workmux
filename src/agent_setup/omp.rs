@@ -142,7 +142,7 @@ mod tests {
         let path = temp.path().join("workmux-status.ts");
         let previous_source = EXTENSION_SOURCE
             .replace(
-                "  pi.on(\"session_start\", async () => {\n    await pi.exec(\"workmux\", [\"register-agent\"]).catch(() => {});\n  });\n\n",
+                "  pi.on(\"session_start\", async () => {\n    pendingPrompt = undefined;\n    await pi.exec(\"workmux\", [\"register-agent\"]).catch(() => {});\n  });\n\n",
                 "",
             );
         std::fs::write(&path, previous_source).unwrap();

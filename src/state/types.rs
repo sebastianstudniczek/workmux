@@ -139,6 +139,11 @@ pub struct AgentState {
     /// identified directly or through process ancestry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+
+    /// Latest user prompt, normalized to one line. Stored only while the
+    /// configuration displays prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 impl AgentState {
@@ -169,6 +174,7 @@ impl AgentState {
             window_cmd: None,
             agent_command: Some(self.command.clone()),
             agent_kind: self.agent_kind.clone(),
+            prompt: self.prompt.clone(),
         }
     }
 }

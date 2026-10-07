@@ -1912,7 +1912,8 @@ The sidebar displays:
 | Key     | Action                 |
 | ------- | ---------------------- |
 | `j`/`k` | Navigate up/down       |
-| `Enter` | Jump to agent          |
+| `Enter` | Run configured action  |
+| `o`     | Focus the agent pane   |
 | `g`/`G` | Jump to first/last     |
 | `v`     | Toggle layout mode     |
 | `f`     | Toggle session filter  |
@@ -1932,7 +1933,11 @@ sidebar:
   position: left # "left" (default) or "top"
   width: 40 # left width in columns, or "15%" for percentage
   layout: tiles # left only: "compact" or "tiles" (default)
+  enter_action: focus # "focus" (default) or "select"
 ```
+
+Set `enter_action: select` to show an agent's window while keeping focus in its
+sidebar. Press `o` to focus the selected agent pane.
 
 The left sidebar defaults to 10% of terminal width, clamped between 25 and 50
 columns. Widths above 80 columns use the default width so tmux pane expansion

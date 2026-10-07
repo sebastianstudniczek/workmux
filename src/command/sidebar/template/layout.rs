@@ -6,6 +6,7 @@ use ratatui::text::Span;
 use super::parser::{Token, TokenId};
 use super::row::TemplateRow;
 use crate::tmux_style::apply_tmux_directives;
+use crate::util::{display_width, truncate_with_ellipsis};
 
 /// Optional layout constraints applied while rendering a template line.
 #[derive(Default)]
@@ -484,39 +485,6 @@ fn styled_span(
     }
 }
 
-fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
-        .sum()
-}
-
-fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    if display_width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 1 {
-        return "\u{2026}".to_string();
-    }
-
-    let mut out = String::new();
-    let mut width = 0;
-    for c in s.chars() {
-        let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-        if width + char_width + 1 > max_width {
-            break;
-        }
-        out.push(c);
-        width += char_width;
-    }
-    let trimmed = out.trim_end();
-    let mut result = trimmed.to_string();
-    result.push('\u{2026}');
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::context::RowContext;
@@ -552,6 +520,7 @@ mod tests {
             window_cmd: None,
             agent_command: None,
             agent_kind: None,
+            prompt: None,
         }
     }
 

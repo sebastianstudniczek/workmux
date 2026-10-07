@@ -32,7 +32,8 @@ Each agent row displays:
 | Key     | Action                    |
 | ------- | ------------------------- |
 | `j`/`k` | Navigate up/down          |
-| `Enter` | Jump to agent pane        |
+| `Enter` | Run the configured action |
+| `o`     | Focus the agent pane      |
 | `g`/`G` | Jump to first/last        |
 | `v`     | Toggle layout mode        |
 | `f`     | Toggle session filter     |
@@ -94,11 +95,17 @@ sidebar:
   width: 40 # left width in columns (default: "10%", clamped 25-50)
   # width: "15%"
   layout: tiles # left only: "compact" or "tiles" (default)
+  enter_action: focus # "focus" (default) or "select"
   git_status: true # collect Git status and GitHub PR/check data (default)
   dim_stale: true # dim stale agents using stale_after
   group_by: project # "project" or "session"; unset keeps one flat list
   collapse_stale: true # while grouped, fold stale agents behind a toggle
 ```
+
+Set `enter_action: select` to show the selected agent's window while keeping
+focus in its sidebar, so `j`/`k` can continue scanning agents. Press `o` to
+focus the selected agent's pane. If the target window has no sidebar, Enter
+falls back to focusing the agent pane. Mouse clicks always focus the pane.
 
 For a horizontal top bar:
 

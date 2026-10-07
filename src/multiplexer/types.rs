@@ -124,6 +124,9 @@ pub struct AgentPane {
     /// before falling back to stem-based profile resolution.
     #[serde(default)]
     pub agent_kind: Option<String>,
+    /// Latest user prompt captured from the agent's hooks.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 impl AgentPane {

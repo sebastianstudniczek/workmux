@@ -14,6 +14,7 @@ use crate::ui::theme::ThemePalette;
 
 use super::super::app::{ResolvedAgentIcons, SidebarApp};
 use super::TokenId;
+use crate::util::display_width;
 
 /// Pre-computed values for every piece of row metadata.
 pub struct RowContext<'a> {
@@ -176,6 +177,7 @@ impl<'a> RowContext<'a> {
                 .map(|index| index.to_string())
                 .unwrap_or_default(),
             TokenId::PaneTitle => self.pane_title.clone().unwrap_or_default(),
+            TokenId::Prompt => self.agent.prompt.clone().unwrap_or_default(),
             TokenId::AgentLabel => self.agent_label.clone(),
             TokenId::StatusIcon => self
                 .status_icon_spans
@@ -337,7 +339,7 @@ impl<'a> RowContext<'a> {
             TokenId::Secondary => Style::default()
                 .fg(self.palette.text)
                 .add_modifier(Modifier::DIM),
-            TokenId::PaneTitle => Style::default().fg(self.palette.dimmed),
+            TokenId::PaneTitle | TokenId::Prompt => Style::default().fg(self.palette.dimmed),
             TokenId::PaneSuffix => Style::default().fg(self.palette.dimmed),
             TokenId::Elapsed => Style::default()
                 .fg(self.palette.text)
@@ -468,12 +470,6 @@ fn is_agent_stale(
 
 fn should_dim_agent(dim_stale: bool, is_stale: bool) -> bool {
     dim_stale && is_stale
-}
-
-pub(crate) fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
-        .sum()
 }
 
 fn format_compact_elapsed(secs: u64) -> String {
@@ -666,6 +662,7 @@ mod tests {
             window_cmd: None,
             agent_command: None,
             agent_kind: None,
+            prompt: None,
         }
     }
 

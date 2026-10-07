@@ -20,6 +20,17 @@ pub use store::StateStore;
 pub(crate) use store::{AgentStateCache, AgentStateSource, ResurrectionAgentState};
 pub use types::{AgentState, LastDoneCycleState, PaneKey, RuntimeState};
 
+/// How a state write changes the agent's latest user prompt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptUpdate {
+    /// Preserve the stored prompt.
+    Keep,
+    /// Replace the stored prompt.
+    Set(String),
+    /// Remove the stored prompt.
+    Clear,
+}
+
 /// Persist an agent state update to the StateStore.
 ///
 /// For tmux, merges state from the same pane process and server lifecycle so
@@ -28,6 +39,7 @@ pub use types::{AgentState, LastDoneCycleState, PaneKey, RuntimeState};
 /// - If `title_override` is Some, uses it. If None, preserves existing stored title,
 ///   falling back to the live pane title.
 /// - If `agent_session_id` is Some, uses it. If None, preserves the existing binding.
+/// - `prompt` keeps, replaces or removes the stored prompt.
 ///
 /// Logs warnings on failure without propagating errors (best-effort persistence).
 pub fn persist_agent_update(
@@ -36,8 +48,17 @@ pub fn persist_agent_update(
     status: Option<AgentStatus>,
     title_override: Option<String>,
     agent_session_id: Option<String>,
+    prompt: PromptUpdate,
 ) {
-    persist_agent_snapshot(mux, pane_id, status, title_override, agent_session_id, true);
+    persist_agent_snapshot(
+        mux,
+        pane_id,
+        status,
+        title_override,
+        agent_session_id,
+        prompt,
+        true,
+    );
 }
 
 /// Register a live agent pane without assigning it an activity status.
@@ -49,8 +70,9 @@ pub fn persist_agent_registration(
     mux: &dyn Multiplexer,
     pane_id: &str,
     agent_session_id: Option<String>,
+    prompt: PromptUpdate,
 ) {
-    persist_agent_snapshot(mux, pane_id, None, None, agent_session_id, false);
+    persist_agent_snapshot(mux, pane_id, None, None, agent_session_id, prompt, false);
 }
 
 /// Clear an agent's persisted status without deleting its state record.
@@ -60,9 +82,11 @@ pub fn persist_agent_registration(
 /// status fields are reset for the exact pane key, so other panes and other
 /// multiplexer instances keep their stored status.
 ///
+/// `clear_prompt` also removes the stored prompt.
+///
 /// Logs warnings on failure without propagating errors (best-effort
 /// persistence).
-pub fn clear_agent_status(mux: &dyn Multiplexer, pane_id: &str) {
+pub fn clear_agent_status(mux: &dyn Multiplexer, pane_id: &str, clear_prompt: bool) {
     let Ok(store) = StateStore::new() else {
         return;
     };
@@ -71,7 +95,7 @@ pub fn clear_agent_status(mux: &dyn Multiplexer, pane_id: &str) {
         instance: mux.instance_id(),
         pane_id: pane_id.to_string(),
     };
-    if let Err(error) = store.clear_agent_status(&pane_key) {
+    if let Err(error) = store.clear_agent_status(&pane_key, clear_prompt) {
         warn!(%error, "failed to persist cleared agent status");
     }
 }
@@ -82,6 +106,7 @@ fn persist_agent_snapshot(
     status: Option<AgentStatus>,
     title_override: Option<String>,
     agent_session_id: Option<String>,
+    prompt: PromptUpdate,
     preserve_existing: bool,
 ) {
     let Ok(store) = StateStore::new() else {
@@ -95,6 +120,7 @@ fn persist_agent_snapshot(
             status,
             title_override,
             agent_session_id,
+            prompt,
             preserve_existing,
         );
         Ok(())
@@ -103,6 +129,7 @@ fn persist_agent_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_agent_snapshot_locked(
     store: &StateStore,
     mux: &dyn Multiplexer,
@@ -110,6 +137,7 @@ fn persist_agent_snapshot_locked(
     status: Option<AgentStatus>,
     title_override: Option<String>,
     agent_session_id: Option<String>,
+    prompt: PromptUpdate,
     preserve_existing: bool,
 ) {
     let pane_key = PaneKey {
@@ -215,6 +243,8 @@ fn persist_agent_snapshot_locked(
             .and_then(|state| state.agent_session_id.clone())
     });
 
+    let prompt = resolve_prompt(prompt, existing.as_ref());
+
     // Snapshot the live title for classification before the resolved
     // `pane_title` consumes `live_info.title`.
     let live_title_for_classify = live_info.title.clone();
@@ -254,10 +284,21 @@ fn persist_agent_snapshot_locked(
         boot_id,
         agent_kind,
         agent_session_id,
+        prompt,
     };
 
     if let Err(error) = store.upsert_agent_locked(&state) {
         warn!(%error, "failed to persist agent state");
+    }
+}
+
+/// `existing` is already limited to the same agent process, so a kept prompt
+/// never crosses into a new agent in a reused pane.
+fn resolve_prompt(update: PromptUpdate, existing: Option<&AgentState>) -> Option<String> {
+    match update {
+        PromptUpdate::Keep => existing.and_then(|state| state.prompt.clone()),
+        PromptUpdate::Set(prompt) => Some(prompt),
+        PromptUpdate::Clear => None,
     }
 }
 
@@ -343,6 +384,41 @@ mod tests {
             resolve_activity_ts(true, None, None, Some(10), 20),
             Some(10)
         );
+    }
+
+    fn state_with_prompt(prompt: &str) -> AgentState {
+        serde_json::from_value(serde_json::json!({
+            "pane_key": {"backend": "tmux", "instance": "default", "pane_id": "%1"},
+            "workdir": "/repo",
+            "status": "working",
+            "status_ts": 1,
+            "pane_title": null,
+            "pane_pid": 1,
+            "command": "claude",
+            "updated_ts": 1,
+            "prompt": prompt,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn prompt_survives_prompt_less_writes() {
+        let existing = state_with_prompt("fix the bug");
+        assert_eq!(
+            resolve_prompt(PromptUpdate::Keep, Some(&existing)),
+            Some("fix the bug".to_string())
+        );
+        assert_eq!(
+            resolve_prompt(PromptUpdate::Set("next".into()), Some(&existing)),
+            Some("next".to_string())
+        );
+        assert_eq!(resolve_prompt(PromptUpdate::Clear, Some(&existing)), None);
+    }
+
+    #[test]
+    fn prompt_is_not_inherited_without_matching_state() {
+        // Registration and pane reuse pass no existing state.
+        assert_eq!(resolve_prompt(PromptUpdate::Keep, None), None);
     }
 
     #[test]

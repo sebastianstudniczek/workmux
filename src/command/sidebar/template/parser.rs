@@ -30,6 +30,7 @@ pub enum TokenId {
     Window,
     WindowIndex,
     PaneTitle,
+    Prompt,
     PaneSuffix,
     Elapsed,
     GitStats,
@@ -63,6 +64,7 @@ impl TokenId {
                 | TokenId::Session
                 | TokenId::Window
                 | TokenId::PaneTitle
+                | TokenId::Prompt
                 | TokenId::Group
         )
     }
@@ -82,6 +84,7 @@ impl fmt::Display for TokenId {
             TokenId::Window => "window",
             TokenId::WindowIndex => "window_index",
             TokenId::PaneTitle => "pane_title",
+            TokenId::Prompt => "prompt",
             TokenId::PaneSuffix => "pane_suffix",
             TokenId::Elapsed => "elapsed",
             TokenId::GitStats => "git_stats",
@@ -231,6 +234,7 @@ pub fn parse_line(input: &str) -> Result<Vec<Token>, ParseError> {
                     "window" => TokenId::Window,
                     "window_index" => TokenId::WindowIndex,
                     "pane_title" => TokenId::PaneTitle,
+                    "prompt" => TokenId::Prompt,
                     "pane_suffix" => TokenId::PaneSuffix,
                     "elapsed" => TokenId::Elapsed,
                     "git_stats" => TokenId::GitStats,
@@ -451,6 +455,7 @@ mod tests {
             TokenId::Window,
             TokenId::WindowIndex,
             TokenId::PaneTitle,
+            TokenId::Prompt,
             TokenId::PaneSuffix,
             TokenId::Elapsed,
             TokenId::GitStats,

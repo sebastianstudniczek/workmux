@@ -1804,8 +1804,7 @@ fn spawn_config_watcher(
 /// # Behavior
 /// - A working agent with no pane output and no RPC activity for >= timeout
 ///   is considered interrupted.
-/// - Interrupted state is sticky: only an RPC update from the agent clears
-///   it. User typing or cursor movement in the pane does not.
+/// - New pane output or an RPC update clears interrupted state.
 /// - After clearing, the agent gets a fresh timeout window before it can
 ///   be marked interrupted again.
 /// - Interrupted agents show no icon and no timer in the sidebar.
@@ -1816,7 +1815,7 @@ struct InactivityTracker {
     /// pane_id -> (content_hash, first_seen_at, updated_ts at recording time)
     entries: HashMap<String, (u64, Instant, u64)>,
     /// pane_id -> updated_ts at the time interruption was confirmed.
-    /// Cleared when updated_ts changes (agent sent a new RPC status update).
+    /// Cleared when pane content or updated_ts changes.
     confirmed: HashMap<String, u64>,
     /// How long content must be unchanged before marking as interrupted.
     timeout: Duration,
@@ -1859,13 +1858,6 @@ impl InactivityTracker {
         self.confirmed
             .retain(|pane_id, _| current.contains_key(pane_id));
         self.identities = current;
-    }
-
-    /// Whether this pane is confirmed interrupted and capture can be skipped.
-    fn is_confirmed(&self, pane_id: &str, updated_ts: u64) -> bool {
-        self.confirmed
-            .get(pane_id)
-            .is_some_and(|&ts| updated_ts <= ts)
     }
 
     /// Check all working agents for inactivity. Returns the set of pane IDs
@@ -1922,11 +1914,6 @@ impl InactivityTracker {
         }
 
         for (pane_id, agent) in &working {
-            // Already confirmed interrupted - skip capture
-            if self.confirmed.contains_key(*pane_id) {
-                continue;
-            }
-
             let Some(raw) = capture(pane_id) else {
                 continue;
             };
@@ -1964,6 +1951,7 @@ impl InactivityTracker {
                 }
                 _ => {
                     // Content changed or RPC updated: reset inactivity window
+                    self.confirmed.remove(*pane_id);
                     self.entries
                         .insert(pane_id.to_string(), (hash, now, current_rpc));
                 }
@@ -2222,7 +2210,7 @@ pub fn run() -> Result<()> {
         if scheduler.capture_due(now) {
             scheduler.finish_capture(now);
             if let Some((agents, _)) = &cached_inputs {
-                pending_captures = Some(gather_captures(agents, mux.as_ref(), &inactivity_tracker));
+                pending_captures = Some(gather_captures(agents, mux.as_ref()));
                 publish_pending = true;
             }
         }
@@ -2608,17 +2596,14 @@ fn apply_tick_effects(
     }
 }
 
-/// Capture pane content for working agents that need checking.
-/// Skips agents already confirmed as interrupted (no I/O needed until they resume).
+/// Capture working panes, including interrupted ones, to detect resumed output.
 fn gather_captures(
     agents: &[crate::multiplexer::AgentPane],
     mux: &dyn Multiplexer,
-    tracker: &InactivityTracker,
 ) -> HashMap<String, String> {
     agents
         .iter()
         .filter(|a| a.status == Some(crate::multiplexer::AgentStatus::Working))
-        .filter(|a| !tracker.is_confirmed(&a.pane_id, a.updated_ts.unwrap_or(0)))
         .filter_map(|a| {
             mux.capture_pane(&a.pane_id, 5)
                 .map(|content| (a.pane_id.clone(), content))
@@ -2701,6 +2686,7 @@ mod tests {
             window_cmd: None,
             agent_command: None,
             agent_kind: None,
+            prompt: None,
         }
     }
 
@@ -3943,7 +3929,7 @@ mod tests {
     }
 
     #[test]
-    fn server_lifecycle_replacement_resets_sticky_interruption() {
+    fn server_lifecycle_replacement_resets_interruption() {
         let mut tracker = InactivityTracker::new(Duration::from_secs(10));
         let agents = vec![working_agent("%1", 1)];
         let t0 = Instant::now();
@@ -4039,7 +4025,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_despite_content_change() {
+    fn content_change_clears_interruption_and_resets_window() {
         let mut tracker = InactivityTracker::new(Duration::from_secs(10));
         let agents = vec![working_agent("%1", 1)];
         let t0 = Instant::now();
@@ -4051,9 +4037,19 @@ mod tests {
         });
         assert!(result.contains("%1"));
 
-        // Content changes (user typing): still interrupted
+        // Output resumes without a status update.
         let result = tracker.check_with(&agents, t0 + Duration::from_secs(12), |_| {
-            Some("user typed something".into())
+            Some("new output".into())
+        });
+        assert!(result.is_empty());
+
+        let result = tracker.check_with(&agents, t0 + Duration::from_secs(17), |_| {
+            Some("new output".into())
+        });
+        assert!(result.is_empty());
+
+        let result = tracker.check_with(&agents, t0 + Duration::from_secs(23), |_| {
+            Some("new output".into())
         });
         assert!(result.contains("%1"));
     }
@@ -4308,6 +4304,7 @@ mod tests {
                 boot_id: None,
                 agent_kind: None,
                 agent_session_id: None,
+                prompt: None,
             };
             store.upsert_agent(&state).unwrap();
         }
@@ -4436,6 +4433,66 @@ mod tests {
             let persisted = store.get_agent(&pane_key("%1")).unwrap().unwrap();
             assert_eq!(persisted.status_ts, Some(1012));
             assert_eq!(persisted.activity_ts, Some(1012));
+        }
+
+        #[test]
+        fn old_working_agent_resumes_output_without_status_update() {
+            let (store, _dir) = test_store();
+            seed_agent(&store, "%1", 100, 1);
+            let mut tracker = InactivityTracker::new(Duration::from_secs(10));
+            let mut last = HashSet::new();
+            let t0 = Instant::now();
+            let now_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // Status and activity are hours old, but changing output is live work.
+            for (elapsed, content) in [(0, "first output"), (8, "more output")] {
+                let output = do_tick(
+                    &mut tracker,
+                    &mut last,
+                    vec![working_agent("%1", 1)],
+                    cap(content),
+                    t0 + Duration::from_secs(elapsed),
+                    now_ts + elapsed,
+                );
+                assert!(output.snapshot.interrupted_pane_ids.is_empty());
+                assert!(output.snapshot.stale_pane_ids.is_empty());
+            }
+
+            // A quiet pane can still be classified as interrupted and stale.
+            let output = do_tick(
+                &mut tracker,
+                &mut last,
+                vec![working_agent("%1", 1)],
+                cap("more output"),
+                t0 + Duration::from_secs(19),
+                now_ts + 19,
+            );
+            assert!(output.snapshot.interrupted_pane_ids.contains("%1"));
+            assert!(output.snapshot.stale_pane_ids.contains("%1"));
+
+            // New output clears both classifications without another status hook.
+            let output = do_tick(
+                &mut tracker,
+                &mut last,
+                vec![working_agent("%1", 1)],
+                cap("resumed output"),
+                t0 + Duration::from_secs(20),
+                now_ts + 20,
+            );
+            assert!(output.snapshot.interrupted_pane_ids.is_empty());
+            assert!(output.snapshot.stale_pane_ids.is_empty());
+            assert_eq!(output.snapshot.agents[0].activity_ts, Some(now_ts + 20));
+
+            apply_tick_effects(&output, &store, BACKEND, INSTANCE);
+            let persisted = store.get_agent(&pane_key("%1")).unwrap().unwrap();
+            assert_eq!(persisted.activity_ts, Some(now_ts + 20));
+            assert_eq!(persisted.updated_ts, 1);
+            let runtime = store.read_runtime(BACKEND, INSTANCE);
+            assert!(runtime.interrupted_pane_ids.is_empty());
+            assert_eq!(runtime.updated_ts, now_ts + 20);
         }
 
         #[test]

@@ -355,7 +355,7 @@ fn process_event(
                         app.toggle_group(&group);
                     } else if let Some(idx) = app.hit_test(mouse.column, mouse.row) {
                         app.select_index(idx);
-                        app.jump_to_selected();
+                        app.focus_selected();
                     }
                 }
                 MouseEventKind::ScrollUp => {
@@ -409,9 +409,10 @@ fn handle_key_press(
             if app.selected_toggle().is_some() {
                 app.toggle_selected_group();
             } else {
-                app.jump_to_selected();
+                app.activate_selected();
             }
         }
+        (KeyCode::Char('o'), _) => app.focus_selected(),
         (KeyCode::Char('h'), _) | (KeyCode::Left, _) => app.set_selected_group_expanded(false),
         (KeyCode::Char('l'), _) | (KeyCode::Right, _) => app.set_selected_group_expanded(true),
         (KeyCode::Char('G'), _) => app.select_last(),

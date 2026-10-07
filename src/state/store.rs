@@ -597,16 +597,19 @@ impl StateStore {
     ///
     /// Resets only the status fields so the pane identity and metadata survive
     /// an explicit clear. Returns whether a record existed for the key.
-    pub fn clear_agent_status(&self, key: &PaneKey) -> Result<bool> {
-        self.with_agent_lock(|store| store.clear_agent_status_locked(key))
+    pub fn clear_agent_status(&self, key: &PaneKey, clear_prompt: bool) -> Result<bool> {
+        self.with_agent_lock(|store| store.clear_agent_status_locked(key, clear_prompt))
     }
 
-    fn clear_agent_status_locked(&self, key: &PaneKey) -> Result<bool> {
+    fn clear_agent_status_locked(&self, key: &PaneKey, clear_prompt: bool) -> Result<bool> {
         let Some(mut state) = self.get_agent(key)? else {
             return Ok(false);
         };
         state.status = None;
         state.status_ts = None;
+        if clear_prompt {
+            state.prompt = None;
+        }
         state.updated_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -696,6 +699,11 @@ impl StateStore {
         let mut manifest = self.load_recovery_manifest_locked(backend, instance)?;
         for state in states {
             let source = RecoverySourceId::from(state);
+            // Resurrection does not use the prompt, so it is not archived.
+            let state = &AgentState {
+                prompt: None,
+                ..state.clone()
+            };
             if let Some(entry) = manifest
                 .entries
                 .iter_mut()
@@ -1614,6 +1622,7 @@ mod tests {
             boot_id: None,
             agent_kind: None,
             agent_session_id: None,
+            prompt: None,
         }
     }
 
@@ -1704,7 +1713,7 @@ mod tests {
         state.agent_session_id = Some("session-1".to_string());
         store.upsert_agent(&state).unwrap();
 
-        assert!(store.clear_agent_status(&key).unwrap());
+        assert!(store.clear_agent_status(&key, false).unwrap());
 
         let cleared = store.get_agent(&key).unwrap().unwrap();
         assert_eq!(cleared.status, None);
@@ -1741,7 +1750,7 @@ mod tests {
             .upsert_agent(&test_agent_state(other_instance.clone()))
             .unwrap();
 
-        assert!(store.clear_agent_status(&target).unwrap());
+        assert!(store.clear_agent_status(&target, false).unwrap());
 
         assert_eq!(store.get_agent(&target).unwrap().unwrap().status, None);
         assert_eq!(
@@ -1759,7 +1768,7 @@ mod tests {
         let (store, _dir) = test_store();
         let key = test_pane_key();
 
-        assert!(!store.clear_agent_status(&key).unwrap());
+        assert!(!store.clear_agent_status(&key, false).unwrap());
         assert!(store.get_agent(&key).unwrap().is_none());
     }
 
@@ -2393,6 +2402,39 @@ mod tests {
                 .iter()
                 .any(|record| record.state.boot_id == old.boot_id)
         );
+    }
+
+    #[test]
+    fn clear_agent_status_removes_prompt_only_when_asked() {
+        let (store, _dir) = test_store();
+        let key = tmux_pane_key("%1");
+        let mut state = test_agent_state(key.clone());
+        state.prompt = Some("fix the bug".to_string());
+        store.upsert_agent(&state).unwrap();
+
+        store.clear_agent_status(&key, false).unwrap();
+        assert_eq!(
+            store.get_agent(&key).unwrap().unwrap().prompt.as_deref(),
+            Some("fix the bug")
+        );
+
+        store.clear_agent_status(&key, true).unwrap();
+        assert_eq!(store.get_agent(&key).unwrap().unwrap().prompt, None);
+    }
+
+    #[test]
+    fn recovery_entries_do_not_archive_prompts() {
+        let (store, _dir) = test_store();
+        let mut state = context_state("tmux", "default", 1, Some("old"), 1);
+        state.prompt = Some("fix the bug".to_string());
+        let manifest = store
+            .with_agent_lock(|store| {
+                store.merge_recovery_locked("tmux", "default", std::slice::from_ref(&state))?;
+                store.load_recovery_manifest_locked("tmux", "default")
+            })
+            .unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].state.prompt, None);
     }
 
     #[test]

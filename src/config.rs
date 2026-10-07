@@ -265,6 +265,8 @@ pub enum AgentColumn {
     Time,
     /// Agent pane title.
     Title,
+    /// Latest prompt the user sent to the agent.
+    Prompt,
 }
 
 /// Columns used when the config does not set `dashboard.agent_columns`.
@@ -458,6 +460,17 @@ impl HorizontalSidebarConfig {
     }
 }
 
+/// Action performed by Enter on a sidebar agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarEnterAction {
+    /// Switch to and focus the agent pane.
+    #[default]
+    Focus,
+    /// Show the agent's window while keeping focus in its sidebar.
+    Select,
+}
+
 /// Configuration for the sidebar.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SidebarConfig {
@@ -476,6 +489,10 @@ pub struct SidebarConfig {
 
     /// Layout mode: "compact" or "tiles". Default: "tiles"
     pub layout: Option<String>,
+
+    /// Action performed by Enter on an agent: "focus" or "select".
+    /// Default: "focus".
+    pub enter_action: Option<SidebarEnterAction>,
 
     /// Horizontal bar configuration.
     #[serde(default)]
@@ -509,6 +526,10 @@ pub struct SidebarConfig {
 }
 
 impl SidebarConfig {
+    pub fn enter_action(&self) -> SidebarEnterAction {
+        self.enter_action.unwrap_or_default()
+    }
+
     pub fn git_status(&self) -> bool {
         self.git_status.unwrap_or(true)
     }
@@ -2636,6 +2657,19 @@ fn merge_grouped_templates(
 }
 
 impl Config {
+    /// Whether status hooks store the latest user prompt. Prompts are kept
+    /// only while the dashboard or sidebar is configured to show them.
+    pub fn prompt_capture_enabled(&self) -> bool {
+        self.dashboard
+            .agent_columns()
+            .contains(&AgentColumn::Prompt)
+            || self
+                .sidebar
+                .templates
+                .as_ref()
+                .is_some_and(crate::command::sidebar::templates_use_prompt)
+    }
+
     /// Load and merge global and project configurations.
     pub fn load(cli_agent: Option<&str>) -> anyhow::Result<Self> {
         Self::load_with_override(cli_agent, None)
@@ -3082,6 +3116,7 @@ impl Config {
             width: project.sidebar.width.or(self.sidebar.width),
             height: project.sidebar.height.or(self.sidebar.height),
             layout: project.sidebar.layout.or(self.sidebar.layout),
+            enter_action: project.sidebar.enter_action.or(self.sidebar.enter_action),
             horizontal: HorizontalSidebarConfig {
                 item_width: project
                     .sidebar
@@ -3628,6 +3663,10 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   # Default: "tiles". Can be toggled at runtime with 'v' key.
 #   layout: tiles
 #
+#   # Enter action: "focus" (default) focuses the agent pane; "select" shows
+#   # its window while keeping focus in the sidebar. Press 'o' to focus the pane.
+#   enter_action: focus
+#
 #   # Row ordering: "recency" (default), "priority" or "window".
 #   sort: recency
 #
@@ -3798,9 +3837,10 @@ mod tests {
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, ExtraMount, FileConfig,
         LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy,
-        PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget, SidebarHeight, SidebarPosition,
-        SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn,
-        is_agent_command, validate_domain, validate_group_add_entry, validate_layouts_config,
+        PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction,
+        SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection, ToolchainMode,
+        WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
+        validate_group_add_entry, validate_layouts_config,
     };
     use crate::test_support;
     use tempfile::TempDir;
@@ -3952,6 +3992,43 @@ mod tests {
             global.merge(project).dashboard.agent_columns(),
             vec![AgentColumn::Title, AgentColumn::Status]
         );
+    }
+
+    #[test]
+    fn prompt_capture_follows_prompt_display() {
+        let enabled = |yaml: &str| {
+            serde_yaml::from_str::<Config>(yaml)
+                .expect("config parses")
+                .prompt_capture_enabled()
+        };
+
+        assert!(!Config::default().prompt_capture_enabled());
+        assert!(enabled("dashboard:\n  agent_columns: [title, prompt]\n"));
+        assert!(!enabled("dashboard:\n  agent_columns: [title]\n"));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    compact: '{primary} {prompt}'\n"
+        ));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    horizontal: ['{primary}', '{prompt}']\n"
+        ));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    grouped:\n      tiles: ['{primary}', '{prompt}']\n"
+        ));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    grouped:\n      compact: '{prompt}'\n"
+        ));
+        // Escaped braces render literal text.
+        assert!(!enabled(
+            "sidebar:\n  templates:\n    compact: '{{prompt}}'\n"
+        ));
+        // Group headers cannot render agent tokens.
+        assert!(!enabled(
+            "sidebar:\n  templates:\n    grouped:\n      header: '{group} {prompt}'\n"
+        ));
+        // An invalid line makes the sidebar fall back to the default tiles.
+        assert!(!enabled(
+            "sidebar:\n  templates:\n    tiles: ['{prompt}', '{unclosed']\n"
+        ));
     }
 
     #[test]
@@ -4695,6 +4772,33 @@ sidebar:
         assert_eq!(config.sidebar.height, Some(SidebarHeight::Percent(10)));
         assert_eq!(config.sidebar.horizontal.item_width, Some(32));
         assert_eq!(config.sidebar.horizontal.item_width(), 32);
+    }
+
+    #[test]
+    fn sidebar_enter_action_defaults_parses_and_merges() {
+        assert_eq!(
+            Config::default().sidebar.enter_action(),
+            SidebarEnterAction::Focus
+        );
+
+        let global: Config = serde_yaml::from_str("sidebar:\n  enter_action: select\n").unwrap();
+        assert_eq!(global.sidebar.enter_action(), SidebarEnterAction::Select);
+        assert_eq!(
+            global
+                .clone()
+                .merge(Config::default())
+                .sidebar
+                .enter_action(),
+            SidebarEnterAction::Select
+        );
+
+        let project: Config = serde_yaml::from_str("sidebar:\n  enter_action: focus\n").unwrap();
+        assert_eq!(
+            global.merge(project).sidebar.enter_action(),
+            SidebarEnterAction::Focus
+        );
+
+        assert!(serde_yaml::from_str::<Config>("sidebar:\n  enter_action: preview\n").is_err());
     }
 
     #[test]

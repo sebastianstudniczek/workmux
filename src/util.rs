@@ -206,6 +206,42 @@ pub(crate) fn expand_worktree_dir_with_home(
     }
 }
 
+/// Terminal cell width of a string.
+pub(crate) fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+        .sum()
+}
+
+/// Shorten a string to at most `max_width` terminal cells, ending in `…` when
+/// anything was cut.
+pub(crate) fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 1 {
+        return "\u{2026}".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 0;
+    for c in s.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if width + char_width + 1 > max_width {
+            break;
+        }
+        out.push(c);
+        width += char_width;
+    }
+    let trimmed = out.trim_end();
+    let mut result = trimmed.to_string();
+    result.push('\u{2026}');
+    result
+}
+
 /// Format an age in seconds as a compact relative string (e.g., "2h", "3d", "1w", "2mo").
 pub fn format_compact_age(secs: u64) -> String {
     let mins = secs / 60;

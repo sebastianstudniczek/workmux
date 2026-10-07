@@ -235,6 +235,7 @@ mod tests {
             boot_id: None,
             agent_kind: agent_kind.map(|kind| kind.to_string()),
             agent_session_id: None,
+            prompt: None,
         }
     }
 

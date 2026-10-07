@@ -63,10 +63,17 @@ dashboard:
 | `status`    | Agent status icons                               |
 | `time`      | Time since the last status change                |
 | `title`     | Agent session title                              |
+| `prompt`    | Latest prompt you sent to the agent              |
 
 A column left out of the list is not rendered, so `agent_columns: [worktree, status, title]` gives a table of just those three. Repeating a column has no effect, and an empty list falls back to the default order.
 
-Dropping `number` hides the jump key, and `1`-`9` still jump to the first nine rows. The `pr` column appears only while at least one agent has a pull request or checks to report, wherever it is placed in the list. The opt-in `pr_title` and `pr_issues` columns stay visible and leave the cell blank when the branch has no pull request or closing issues. `pr_issues` uses GitHub's closing issue references, not arbitrary issue mentions in pull request text. Same-repository issues appear as `#123`; cross-repository issues include the repository, such as `owner/repo#123`. The opt-in `window` column shows the tmux window index used by `prefix + <n>`; backends without window indexes leave the cell blank. A trailing `title`, `pr_title`, or `pr_issues` takes the width left over by the other columns; anywhere else it sizes to its content, and the leftover width sits at the right edge of the table.
+Dropping `number` hides the jump key, and `1`-`9` still jump to the first nine rows. The `pr` column appears only while at least one agent has a pull request or checks to report, wherever it is placed in the list. The opt-in `pr_title` and `pr_issues` columns stay visible and leave the cell blank when the branch has no pull request or closing issues. `pr_issues` uses GitHub's closing issue references, not arbitrary issue mentions in pull request text. Same-repository issues appear as `#123`; cross-repository issues include the repository, such as `owner/repo#123`. The opt-in `window` column shows the tmux window index used by `prefix + <n>`; backends without window indexes leave the cell blank. A trailing `title`, `prompt`, `pr_title`, or `pr_issues` takes the width left over by the other columns; anywhere else it sizes to its content, and the leftover width sits at the right edge of the table.
+
+#### Prompt column
+
+The opt-in `prompt` column shows the last prompt you sent to each agent, on one line and cut with `…` to fit. Status hooks store the prompt only while the `prompt` column or a [`{prompt}` sidebar token](/guide/sidebar/customization/#tokens) is configured, evaluated with the agent's project configuration. Removing both stops capture, and each agent's stored prompt is deleted at its next status update.
+
+Prompts come from Claude Code, Codex, Gemini CLI, Copilot CLI, Grok, OpenCode, pi, and oh-my-pi. Prompts sent to subagents and messages the agent injects itself are ignored. A prompt with no text, such as an image alone, keeps the previous prompt. A prompt passed when the agent starts, such as `workmux add -p`, may not be shown until you send the next one. OpenCode, pi, and oh-my-pi report prompts once `workmux setup` updates their status plugin.
 
 ### Worktree columns
 

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use crate::cmd::Cmd;
 use crate::config::{
-    AgentIcons, Config, SidebarGroupBy, SidebarPosition, SidebarWidth, StatusIcons,
-    TemplatesConfig, ThemeConfig, ThemeMode,
+    AgentIcons, Config, SidebarEnterAction, SidebarGroupBy, SidebarPosition, SidebarWidth,
+    StatusIcons, TemplatesConfig, ThemeConfig, ThemeMode,
 };
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
@@ -313,6 +313,7 @@ pub struct SidebarApp {
     pub collapse_stale: bool,
     pub position: SidebarPosition,
     pub layout_mode: SidebarLayoutMode,
+    pub enter_action: SidebarEnterAction,
     /// Area where the list was last rendered (for mouse hit testing)
     pub list_area: Rect,
     /// Window prefix from config
@@ -321,8 +322,10 @@ pub struct SidebarApp {
     host_identity: Option<HostIdentity>,
     /// Index of the agent in the sidebar's host window (updated each snapshot)
     pub host_agent_idx: Option<usize>,
-    /// Whether this sidebar's host window is the active window in the session
+    /// Whether this sidebar's host window is the active window in the session.
     host_window_active: bool,
+    /// Whether this sidebar pane itself was active in the latest snapshot.
+    host_sidebar_active: bool,
     selection_mode: SelectionMode,
     /// Git status per worktree path (received from daemon snapshots).
     pub git_statuses: HashMap<PathBuf, GitStatus>,
@@ -411,11 +414,13 @@ impl SidebarApp {
             collapse_stale: false,
             position: SidebarPosition::Left,
             layout_mode: SidebarLayoutMode::Compact,
+            enter_action: SidebarEnterAction::Focus,
             list_area: Rect::default(),
             window_prefix: "wm-".to_string(),
             host_identity: None,
             host_agent_idx: None,
             host_window_active: true,
+            host_sidebar_active: false,
             selection_mode: SelectionMode::FollowHost,
             git_statuses: HashMap::new(),
             pr_statuses: HashMap::new(),
@@ -510,11 +515,13 @@ impl SidebarApp {
             collapse_stale: false,
             position,
             layout_mode: SidebarLayoutMode::default(),
+            enter_action: config.sidebar.enter_action(),
             list_area: Rect::default(),
             window_prefix,
             host_identity,
             host_agent_idx: None,
             host_window_active: true,
+            host_sidebar_active: false,
             selection_mode: SelectionMode::FollowHost,
             git_statuses: HashMap::new(),
             pr_statuses: HashMap::new(),
@@ -581,6 +588,8 @@ impl SidebarApp {
             .host_identity
             .as_ref()
             .map(|identity| snapshot.active_pane_ids.contains(&identity.pane_id));
+        let sidebar_became_active = host_sidebar_active == Some(true) && !self.host_sidebar_active;
+        self.host_sidebar_active = host_sidebar_active.unwrap_or(false);
 
         // Manual selection belongs to direct sidebar interaction. When an agent
         // pane has focus, the selection follows the agent in the host window.
@@ -620,6 +629,27 @@ impl SidebarApp {
         // Rows are rebuilt after filtering so header counts reflect what this
         // client actually shows.
         self.rebuild_rows();
+
+        // A source sidebar leaves the exact agent pane ID on the destination
+        // pane before switching to it. Consume that one-shot handoff when this
+        // sidebar gains focus so navigation continues from the selected agent.
+        let handed_off_agent = sidebar_became_active
+            .then(|| {
+                self.host_identity
+                    .as_ref()
+                    .and_then(|identity| super::panes::take_pending_selection(&identity.pane_id))
+            })
+            .flatten()
+            .and_then(|pane_id| {
+                self.agents
+                    .iter()
+                    .position(|agent| agent.pane_id == pane_id)
+            });
+        if let Some(idx) = handed_off_agent {
+            self.selection_mode = SelectionMode::Manual;
+            self.select_agent(Some(idx));
+            return;
+        }
 
         // A selection resting on a toggle follows its group, not an agent.
         if let Some(row) = selected_toggle.and_then(|group| self.toggle_row_of(&group)) {
@@ -688,6 +718,7 @@ impl SidebarApp {
         self.horizontal_item_width = cfg.sidebar.horizontal.item_width();
         self.current_width = cfg.sidebar.width.clone();
         self.dim_stale = cfg.sidebar.dim_stale();
+        self.enter_action = cfg.sidebar.enter_action();
         self.configured_group_by = cfg.sidebar.group_by();
     }
 
@@ -1288,15 +1319,64 @@ impl SidebarApp {
         self.tile_heights.get(row).copied().unwrap_or(3)
     }
 
-    pub fn jump_to_selected(&mut self) {
-        if let Some(idx) = self.selected_agent_idx()
-            && let Some(agent) = self.agents.get(idx)
-        {
-            let pane_id = agent.pane_id.clone();
-            let _ = self.mux.switch_to_pane(&pane_id, None);
-            // Signal daemon directly to bypass tmux hook round-trip latency
-            super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+    pub fn activate_selected(&mut self) {
+        match self.enter_action {
+            SidebarEnterAction::Focus => self.focus_selected(),
+            SidebarEnterAction::Select => self.select_selected_window(),
         }
+    }
+
+    pub fn focus_selected(&mut self) {
+        let pane_id = self
+            .selected_agent_idx()
+            .and_then(|idx| self.agents.get(idx))
+            .map(|agent| agent.pane_id.clone());
+        if let Some(pane_id) = pane_id {
+            self.focus_pane(&pane_id);
+        }
+    }
+
+    fn focus_pane(&self, pane_id: &str) {
+        let _ = self.mux.switch_to_pane(pane_id, None);
+        // Signal daemon directly to bypass tmux hook round-trip latency.
+        super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+    }
+
+    fn select_selected_window(&mut self) {
+        let Some((agent_pane_id, window_id)) = self
+            .selected_agent_idx()
+            .and_then(|idx| self.agents.get(idx))
+            .map(|agent| (agent.pane_id.clone(), agent.window_id.clone()))
+        else {
+            return;
+        };
+
+        // The selected window is already visible and this sidebar already has
+        // focus, so switching panes would only disturb the current selection.
+        if self.host_window_id() == Some(window_id.as_str()) {
+            return;
+        }
+
+        let target_sidebar = (!window_id.is_empty())
+            .then(|| {
+                super::panes::find_sidebar_pane_in_window(&window_id)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        if let Some(sidebar_pane_id) = target_sidebar
+            && super::panes::set_pending_selection(&sidebar_pane_id, &agent_pane_id).is_ok()
+        {
+            if self.mux.switch_to_pane(&sidebar_pane_id, None).is_ok() {
+                super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+                return;
+            }
+            super::panes::clear_pending_selection(&sidebar_pane_id);
+        }
+
+        // Session-scoped sidebars may show agents in sessions where no sidebar
+        // exists. Preserve reachability by falling back to the focus action.
+        self.focus_pane(&agent_pane_id);
     }
 
     pub fn toggle_layout_mode(&mut self) {
@@ -1646,6 +1726,19 @@ fn resolved_template_strings(
             .and_then(|g| g.header.clone())
             .unwrap_or_else(|| DEFAULT_GROUP_HEADER_TEMPLATE.to_string()),
     }
+}
+
+/// Whether an agent template the sidebar renders, grouped or not, shows
+/// `{prompt}`.
+pub(crate) fn templates_use_prompt(templates: &TemplatesConfig) -> bool {
+    [false, true].into_iter().any(|grouped| {
+        let (parsed, _) = parse_templates(&resolved_template_strings(Some(templates), grouped));
+        std::iter::once(&parsed.compact)
+            .chain(&parsed.tiles)
+            .chain(&parsed.horizontal)
+            .flatten()
+            .any(|token| *token == Token::Field(TokenId::Prompt))
+    })
 }
 
 fn default_template_lines(default_lines: &[&str]) -> Vec<Vec<Token>> {
@@ -2176,6 +2269,7 @@ mod tests {
             window_cmd: None,
             agent_command: None,
             agent_kind: None,
+            prompt: None,
         }
     }
 
@@ -2362,6 +2456,7 @@ mod grouping_tests {
             window_cmd: None,
             agent_command: None,
             agent_kind: None,
+            prompt: None,
         }
     }
 
@@ -3071,6 +3166,7 @@ mod filter_tests {
                 window_cmd: None,
                 agent_command: None,
                 agent_kind: None,
+                prompt: None,
             },
             AgentPane {
                 session: "s".to_string(),
@@ -3087,6 +3183,7 @@ mod filter_tests {
                 window_cmd: None,
                 agent_command: None,
                 agent_kind: None,
+                prompt: None,
             },
         ];
         let active_panes = std::collections::HashSet::from(["%2".to_string()]);

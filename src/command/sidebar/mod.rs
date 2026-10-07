@@ -34,6 +34,8 @@ use crate::cmd::Cmd;
 use crate::config::{SidebarHeight, SidebarPosition, SidebarWidth};
 use anyhow::{Result, anyhow, bail};
 
+pub(crate) use self::app::templates_use_prompt;
+
 use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon, signal_daemon_for};
 use self::hooks::{install_hooks, remove_hooks};
 use self::panes::{
