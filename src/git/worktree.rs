@@ -308,6 +308,30 @@ pub fn list_worktrees() -> Result<Vec<(PathBuf, String)>> {
 
 /// List all worktrees with their branches, optionally in a specific workdir
 pub fn list_worktrees_in(workdir: Option<&Path>) -> Result<Vec<(PathBuf, String)>> {
+    Ok(list_worktrees_with_main_in(workdir)?.worktrees)
+}
+
+/// Worktree rows and the primary entry, including a bare repository anchor.
+pub struct WorktreeListing {
+    pub main_path: PathBuf,
+    pub worktrees: Vec<(PathBuf, String)>,
+}
+
+fn parse_worktree_listing(output: &str) -> Result<WorktreeListing> {
+    let main_path = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("No main repository entry in worktree list"))?;
+    Ok(WorktreeListing {
+        main_path,
+        worktrees: parse_worktree_list_porcelain(output)?,
+    })
+}
+
+/// List worktrees without losing the identity of the primary porcelain entry.
+pub fn list_worktrees_with_main_in(workdir: Option<&Path>) -> Result<WorktreeListing> {
     let cmd = Cmd::new("git").args(&["worktree", "list", "--porcelain"]);
     let cmd = match workdir {
         Some(path) => cmd.workdir(path),
@@ -316,7 +340,7 @@ pub fn list_worktrees_in(workdir: Option<&Path>) -> Result<Vec<(PathBuf, String)
     let list = cmd
         .run_and_capture_stdout()
         .context("Failed to list worktrees")?;
-    parse_worktree_list_porcelain(&list)
+    parse_worktree_listing(&list)
 }
 
 /// Store per-worktree metadata in git config.
@@ -639,6 +663,35 @@ mod tests {
     use crate::test_support;
     use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn listing_preserves_bare_anchor_when_first_linked_worktree_changes() {
+        for first in ["branch-1", "branch-2"] {
+            let output = format!(
+                "worktree /project\nbare\n\nworktree /project/worktrees/{first}\nHEAD abc\nbranch refs/heads/{first}\n\nworktree /project/worktrees/dev\nHEAD abc\nbranch refs/heads/dev\n"
+            );
+            let listing = parse_worktree_listing(&output).unwrap();
+            assert_eq!(listing.main_path, PathBuf::from("/project"));
+            assert_eq!(listing.worktrees.len(), 2);
+            assert!(
+                listing
+                    .worktrees
+                    .iter()
+                    .all(|(path, _)| *path != listing.main_path)
+            );
+        }
+    }
+
+    #[test]
+    fn listing_preserves_primary_checkout_even_if_its_path_is_missing() {
+        let listing = parse_worktree_listing(
+            "worktree /missing-primary\nHEAD abc\nbranch refs/heads/feature\n\nworktree /linked\nHEAD abc\nbranch refs/heads/main\n\nworktree /detached\nHEAD abc\ndetached\n",
+        ).unwrap();
+        assert_eq!(listing.main_path, PathBuf::from("/missing-primary"));
+        assert_eq!(listing.worktrees[0].1, "feature");
+        assert_eq!(listing.worktrees[1].1, "main");
+        assert_eq!(listing.worktrees[2].1, "(detached)");
+    }
 
     #[test]
     fn create_worktree_in_uses_explicit_repo_not_process_cwd() {

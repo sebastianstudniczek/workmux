@@ -149,7 +149,7 @@ pub fn render_confirm_remove(f: &mut Frame, app: &App) {
 pub fn render_help(f: &mut Frame, app: &App) {
     let ctx = get_help_context(app);
     let title = context_title(ctx);
-    let keybindings = help_rows(ctx);
+    let keybindings = help_rows(ctx, app.config.dashboard.input_exit_key());
 
     // Calculate dimensions based on content
     let row_count = keybindings.len() as u16;

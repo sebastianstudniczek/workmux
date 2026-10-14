@@ -30,6 +30,7 @@ mod app;
 mod diff;
 mod diff_ops;
 mod keymap;
+mod layout;
 mod mouse;
 mod scope;
 mod settings;
@@ -152,7 +153,7 @@ pub fn run(
     // get queued and processed before the app is ready.
     let mut app = App::new(mux, session_filter, event_tx.clone())?;
 
-    // CLI preview size overrides config/tmux if provided
+    // CLI preview size overrides config and saved preference if provided
     if let Some(size) = cli_preview_size {
         app.preview_size = size;
     }
@@ -600,12 +601,13 @@ fn handle_terminal_event(
     if ctx == Context::DiffNormal
         && let ViewMode::Diff(ref diff) = app.view_mode
         && diff.is_branch_diff
-        && let Some(actions::Action::EnterPatchMode) = action_for_key(ctx, key)
+        && let Some(actions::Action::EnterPatchMode) =
+            action_for_key(ctx, key, app.config.dashboard.input_exit_key())
     {
         return;
     }
 
-    if let Some(action) = action_for_key(ctx, key) {
+    if let Some(action) = action_for_key(ctx, key, app.config.dashboard.input_exit_key()) {
         let refreshed_preview = apply_action(app, action);
         if refreshed_preview {
             *last_preview_refresh = std::time::Instant::now();

@@ -76,9 +76,9 @@ pub struct App {
     last_git_fetch: std::time::Instant,
     /// Flag to track if a git fetch is in progress (prevents thread pile-up)
     pub is_git_fetching: Arc<AtomicBool>,
-    /// PR info indexed by repo root, then branch name
+    /// PR info indexed by canonical common Git directory, then branch name
     pr_statuses: HashMap<PathBuf, HashMap<String, PrSummary>>,
-    /// GitHub check info indexed by repo root, then branch name
+    /// GitHub check info indexed by canonical common Git directory, then branch name
     check_statuses: HashMap<PathBuf, HashMap<String, CheckSummary>>,
     /// Last PR fetch time
     last_pr_fetch: std::time::Instant,
@@ -88,6 +88,8 @@ pub struct App {
     pub event_tx: mpsc::Sender<AppEvent>,
     /// Cache of repo roots for agent paths
     repo_roots: HashMap<PathBuf, PathBuf>,
+    /// Common Git directory keys for agent paths, separate from checkout roots.
+    repo_keys: HashMap<PathBuf, PathBuf>,
     /// Frame counter for spinner animation (increments each tick)
     pub spinner_frame: u8,
     /// Whether to hide stale agents from the list
@@ -254,6 +256,7 @@ impl App {
             is_pr_fetching: Arc::new(AtomicBool::new(false)),
             event_tx,
             repo_roots: HashMap::new(),
+            repo_keys: HashMap::new(),
             spinner_frame: 0,
             hide_stale,
             show_help: false,
@@ -343,7 +346,9 @@ impl App {
         let paths_to_resolve: Vec<PathBuf> = self
             .all_agents
             .iter()
-            .filter(|a| !self.repo_roots.contains_key(&a.path))
+            .filter(|a| {
+                !self.repo_roots.contains_key(&a.path) || !self.repo_keys.contains_key(&a.path)
+            })
             .map(|a| a.path.clone())
             .collect();
 
@@ -354,7 +359,8 @@ impl App {
                 .map(|path| {
                     std::thread::spawn(move || {
                         let root = git::get_repo_root_for(&path).ok();
-                        (path, root)
+                        let key = git::get_repository_key_in(Some(&path)).ok();
+                        (path, root, key)
                     })
                 })
                 .collect::<Vec<_>>()
@@ -362,9 +368,12 @@ impl App {
                 .filter_map(|handle| handle.join().ok())
                 .collect();
 
-            for (path, root) in results {
+            for (path, root, key) in results {
                 if let Some(r) = root {
-                    self.repo_roots.insert(path, r);
+                    self.repo_roots.insert(path.clone(), r);
+                }
+                if let Some(key) = key {
+                    self.repo_keys.insert(path, key);
                 }
             }
         }

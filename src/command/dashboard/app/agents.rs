@@ -30,19 +30,6 @@ fn should_close_after_jump(mux_exits_on_jump: bool, close_on_jump: bool) -> bool
     mux_exits_on_jump && close_on_jump
 }
 
-pub(super) fn repo_root_for_worktree<'a>(
-    all_worktrees: &'a [crate::workflow::types::WorktreeInfo],
-    worktree: &crate::workflow::types::WorktreeInfo,
-) -> Option<&'a PathBuf> {
-    let project = agent::extract_project_name(&worktree.path);
-    all_worktrees
-        .iter()
-        .find(|candidate| {
-            candidate.is_main && agent::extract_project_name(&candidate.path) == project
-        })
-        .map(|candidate| &candidate.path)
-}
-
 impl App {
     /// Apply name and stale filters to the cached agent list, sort, and restore selection.
     /// This is fast (in-memory only) and safe to call on every filter keystroke.
@@ -533,7 +520,7 @@ impl App {
 
     /// Get PR info for an agent by looking up its branch in PR statuses
     pub fn get_pr_for_agent(&self, agent: &AgentPane) -> Option<&PrSummary> {
-        let repo_root = self.repo_roots.get(&agent.path)?;
+        let repo_root = self.repo_keys.get(&agent.path)?;
         let git_status = self.git_statuses.get(&agent.path)?;
         let branch = git_status.branch.as_ref()?;
         // Don't show PRs for main/master - you merge INTO main, not FROM it
@@ -544,7 +531,7 @@ impl App {
     }
 
     pub fn get_checks_for_agent(&self, agent: &AgentPane) -> Option<&CheckSummary> {
-        let repo_root = self.repo_roots.get(&agent.path)?;
+        let repo_root = self.repo_keys.get(&agent.path)?;
         let branch = self.git_statuses.get(&agent.path)?.branch.as_ref()?;
         self.check_statuses
             .get(repo_root)?
@@ -556,9 +543,8 @@ impl App {
         &self,
         worktree: &crate::workflow::types::WorktreeInfo,
     ) -> Option<&CheckSummary> {
-        let repo_root = repo_root_for_worktree(&self.all_worktrees, worktree)?;
         self.check_statuses
-            .get(repo_root)?
+            .get(&worktree.repo_key)?
             .get(&worktree.branch)
             .filter(|summary| summary.should_display_for_branch(&worktree.branch))
     }
@@ -644,45 +630,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{repo_root_for_worktree, should_close_after_jump};
-    use crate::config::MuxMode;
-    use crate::workflow::types::WorktreeInfo;
-    use std::path::PathBuf;
-
-    fn worktree(path: &str, is_main: bool) -> WorktreeInfo {
-        WorktreeInfo {
-            handle: path.rsplit('/').next().unwrap().into(),
-            branch: if is_main { "main" } else { "feature" }.into(),
-            path: PathBuf::from(path),
-            is_main,
-            mode: MuxMode::Window,
-            has_mux_window: false,
-            has_unmerged: false,
-            pr_info: None,
-            agent_status: None,
-            created_at: None,
-            base_branch: None,
-        }
-    }
-
-    #[test]
-    fn worktree_repo_lookup_uses_its_projects_main_path() {
-        let worktrees = vec![
-            worktree("/tmp/alpha", true),
-            worktree("/tmp/alpha__worktrees/feature", false),
-            worktree("/tmp/beta", true),
-            worktree("/tmp/beta__worktrees/feature", false),
-        ];
-
-        assert_eq!(
-            repo_root_for_worktree(&worktrees, &worktrees[1]),
-            Some(&PathBuf::from("/tmp/alpha"))
-        );
-        assert_eq!(
-            repo_root_for_worktree(&worktrees, &worktrees[3]),
-            Some(&PathBuf::from("/tmp/beta"))
-        );
-    }
+    use super::should_close_after_jump;
 
     #[test]
     fn jump_closes_only_when_config_and_multiplexer_allow_it() {

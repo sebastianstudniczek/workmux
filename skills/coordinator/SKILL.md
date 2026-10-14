@@ -150,6 +150,11 @@ Output is ANSI-stripped plain text.
 
 ### Send Instructions
 
+Send only actionable changes to the agent's current assignment: corrections,
+verified blockers, concrete integration requirements, or approved scope changes.
+Batch guidance; keep speculative future plans and progress chatter to yourself.
+New phases get separate assignments/worktrees, not additions to active agents.
+
 ```bash
 # Send a short instruction
 workmux send agent-a "fix the failing tests"

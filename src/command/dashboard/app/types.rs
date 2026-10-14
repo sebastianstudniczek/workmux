@@ -622,6 +622,7 @@ mod removal_tests {
 
     fn worktree(path: &str) -> WorktreeInfo {
         WorktreeInfo {
+            repo_key: "/repo/.git".into(),
             handle: "feature".into(),
             branch: "feature".into(),
             path: path.into(),

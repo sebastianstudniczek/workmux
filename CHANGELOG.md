@@ -21,6 +21,31 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## v0.1.276 (2026-10-14)
+
+- Fix sidebar sizing and preserve content pane proportions when opening or closing the sidebar on tmux 3.8. ([#325](https://github.com/raine/workmux/issues/325))
+
+## v0.1.275 (2026-10-13)
+
+- Fix missing latest user prompts for OpenCode V2 in the dashboard and sidebar, including follow-up prompts sent while the agent is working.
+
+## v0.1.274 (2026-10-12)
+
+- Add status tracking for OpenCode V2's terminal UI; run `workmux setup` to install the integration. ([#306](https://github.com/raine/workmux/pull/306))
+- Set `dashboard.layout: side_by_side` to place the preview on the left and the table on the right, giving the preview the full dashboard content height. ([#323](https://github.com/raine/workmux/issues/323))
+- Choose a Ctrl-letter key to leave dashboard input mode with `dashboard.input_exit_key`, allowing Escape to be sent to the agent instead. Escape remains the default exit key. ([#322](https://github.com/raine/workmux/issues/322))
+
+## v0.1.273 (2026-10-11)
+
+- Fix missing pull request details and check status in the dashboard for bare repository worktrees. ([#321](https://github.com/raine/workmux/issues/321))
+
+## v0.1.272 (2026-10-09)
+
+- Reduce sidebar background CPU use by avoiding repeated Git calculations and project config lookups.
+- Reduce memory use for workmux commands and sidebar clients.
+- Reset sidebar scrolling to the top when focusing an agent or returning to its window.
+- Fix agents inheriting another repository's project config, and automatically pick up newly created or replaced project configs in the sidebar.
+
 ## v0.1.271 (2026-10-04)
 
 - Set `sidebar.enter_action: select` to show an agent's window with Enter while keeping sidebar focus for continued keyboard navigation; press `o` to focus the agent pane. ([#315](https://github.com/raine/workmux/issues/315))

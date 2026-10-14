@@ -255,6 +255,8 @@ pub struct AgentStatusSummary {
 /// List all worktrees with their status
 #[derive(Clone)]
 pub struct WorktreeInfo {
+    /// Canonical common Git directory shared by every checkout of this repository.
+    pub repo_key: PathBuf,
     pub handle: String,
     pub branch: String,
     pub path: PathBuf,

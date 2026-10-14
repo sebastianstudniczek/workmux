@@ -14,6 +14,7 @@ use crate::agent_display::strip_oc_title_prefix;
 use crate::config::AgentColumn;
 
 use super::super::app::{App, DashboardTab};
+use super::super::layout::{dashboard_content_areas, dashboard_outer_areas};
 use super::format;
 use super::format::{format_git_status, format_pr_status, truncate};
 use super::theme::ThemePalette;
@@ -74,32 +75,15 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App) {
     // Check if backend supports preview
     let supports_preview = app.mux.supports_preview();
 
-    // Outer layout: fixed-height tab header and footer, flexible content area.
-    // Fill(1) guarantees the content takes exactly the remaining space.
-    let outer = Layout::vertical([
-        Constraint::Length(2), // Tab header + spacer
-        Constraint::Fill(1),   // Content (table + optional preview)
-        Constraint::Length(1), // Footer
-    ])
-    .split(area);
-
+    let outer = dashboard_outer_areas(area);
     let tab_area = outer[0];
-    let content_area = outer[1];
     let footer_area = outer[2];
-
-    // Split content area into table + preview (or just table if no preview)
-    let (table_area, preview_area) = if !supports_preview {
-        (content_area, None)
-    } else {
-        let table_size = 100u16.saturating_sub(app.preview_size as u16);
-        // Use Fill() proportional constraints to split space safely without overflow
-        let content_chunks = Layout::vertical([
-            Constraint::Fill(table_size),              // Table
-            Constraint::Fill(app.preview_size as u16), // Preview
-        ])
-        .split(content_area);
-        (content_chunks[0], Some(content_chunks[1]))
-    };
+    let (table_area, preview_area) = dashboard_content_areas(
+        outer[1],
+        supports_preview,
+        app.preview_size,
+        app.config.dashboard.layout.unwrap_or_default(),
+    );
 
     // Tab header
     render_tab_header(f, app, tab_area);
@@ -706,7 +690,10 @@ fn render_footer_input<'a>(app: &'a App) -> Paragraph<'a> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" \u{2014} type to send keys to agent  "),
-        Span::styled("Esc", Style::default().fg(app.palette.keycap)),
+        Span::styled(
+            app.config.dashboard.input_exit_key().to_string(),
+            Style::default().fg(app.palette.keycap),
+        ),
         Span::raw(" exit"),
     ]))
 }

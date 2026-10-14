@@ -772,8 +772,13 @@ fn next_worker_timeout(pending: &HashMap<PathBuf, Instant>, debounce: Duration) 
 
 /// Refresh git status once for a worktree and publish it for every agent path.
 /// Returns true if any published status changed, ignoring cached_at.
-fn refresh_git_status(worktree: &Path, agent_paths: &[PathBuf], cache: &GitCache) -> bool {
-    let new_status = crate::git::get_git_status(worktree, None);
+fn refresh_git_status(
+    worktree: &Path,
+    agent_paths: &[PathBuf],
+    cache: &GitCache,
+    computations: &mut crate::git::GitStatusCache,
+) -> bool {
+    let new_status = crate::git::get_git_status_cached(worktree, None, computations);
     let Ok(mut cache) = cache.lock() else {
         return true;
     };
@@ -925,9 +930,7 @@ fn github_fetch_due(branch_set_changed: bool, elapsed: Duration) -> bool {
 }
 
 fn github_repo_key(path: &Path) -> Option<PathBuf> {
-    crate::git::get_git_common_dir_in(Some(path))
-        .ok()
-        .and_then(|git_dir| git_dir.canonicalize().ok().or(Some(git_dir)))
+    crate::git::get_repository_key_in(Some(path)).ok()
 }
 
 fn group_github_branches(
@@ -1338,6 +1341,7 @@ fn spawn_git_worker(
             }
         };
 
+        let mut computations = crate::git::GitStatusCache::default();
         let mut active_entries: Vec<GitWorkerPath> = Vec::new();
         let mut roots_by_agent: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
         let mut resolved_worktrees: HashMap<PathBuf, ResolvedGitWorktree> = HashMap::new();
@@ -1446,6 +1450,7 @@ fn spawn_git_worker(
                     unique_active = resolved_worktrees.keys().cloned().collect();
                     unique_active.sort();
                     let unique_set: HashSet<PathBuf> = unique_active.iter().cloned().collect();
+                    computations.retain(&unique_set);
                     gitignores.retain(|path, _| unique_set.contains(path));
                     ignored_tracked_paths.retain(|path, _| unique_set.contains(path));
                     pending_worktrees.retain(|path, _| unique_set.contains(path));
@@ -1577,7 +1582,12 @@ fn spawn_git_worker(
                 }
                 pending_worktrees.remove(&path);
                 if let Some(worktree) = resolved_worktrees.get(&path) {
-                    if refresh_git_status(&path, &worktree.agent_paths, &cache_clone) {
+                    if refresh_git_status(
+                        &path,
+                        &worktree.agent_paths,
+                        &cache_clone,
+                        &mut computations,
+                    ) {
                         any_changed = true;
                     }
                     last_refreshed.insert(path, Instant::now());
@@ -1592,6 +1602,92 @@ fn spawn_git_worker(
     });
 
     (cache, tx)
+}
+
+const PROJECT_CONFIG_REVALIDATE: Duration = Duration::from_secs(30);
+
+struct ProjectConfigEntry {
+    observation: Option<crate::config::ProjectConfigDiscovery>,
+    retry_at: Instant,
+    failures: u32,
+}
+
+#[derive(Default)]
+struct ProjectConfigCache {
+    entries: HashMap<PathBuf, ProjectConfigEntry>,
+    next_sweep: Option<Instant>,
+}
+
+struct ProjectConfigResolution {
+    directories: HashSet<PathBuf>,
+    changed: bool,
+    reconciled: bool,
+}
+
+impl ProjectConfigCache {
+    fn resolve(
+        &mut self,
+        live_paths: &HashSet<PathBuf>,
+        now: Instant,
+        invalidated: bool,
+        mut discover: impl FnMut(&Path) -> Result<crate::config::ProjectConfigDiscovery>,
+    ) -> ProjectConfigResolution {
+        self.entries.retain(|path, _| live_paths.contains(path));
+        let sweep = self.next_sweep.is_none_or(|deadline| now >= deadline);
+        if sweep {
+            self.next_sweep = Some(now + PROJECT_CONFIG_REVALIDATE);
+        }
+        let mut changed = false;
+        for path in live_paths {
+            let entry = self
+                .entries
+                .entry(path.clone())
+                .or_insert(ProjectConfigEntry {
+                    observation: None,
+                    retry_at: now,
+                    failures: 0,
+                });
+            if !sweep && !invalidated && now < entry.retry_at {
+                continue;
+            }
+            match discover(path) {
+                Ok(observation) => {
+                    changed |= entry.failures > 0
+                        || entry
+                            .observation
+                            .as_ref()
+                            .is_some_and(|old| old != &observation);
+                    entry.observation = Some(observation);
+                    entry.failures = 0;
+                    entry.retry_at = now + PROJECT_CONFIG_REVALIDATE;
+                }
+                Err(error) => {
+                    entry.failures = entry.failures.saturating_add(1);
+                    let backoff = Duration::from_secs(1 << entry.failures.min(5))
+                        .min(PROJECT_CONFIG_REVALIDATE);
+                    entry.retry_at = now + backoff;
+                    tracing::debug!(path = %path.display(), %error, "project config discovery failed");
+                }
+            }
+        }
+        ProjectConfigResolution {
+            directories: self
+                .entries
+                .values()
+                .filter_map(|entry| {
+                    entry
+                        .observation
+                        .as_ref()?
+                        .location
+                        .as_ref()
+                        .map(|location| location.config_dir.clone())
+                })
+                .collect(),
+            // Watcher invalidation already requests a client reload.
+            changed: changed && !invalidated,
+            reconciled: sweep || invalidated,
+        }
+    }
 }
 
 const CONFIG_BASENAMES: [&str; 4] = ["config.yaml", "config.yml", ".workmux.yaml", ".workmux.yml"];
@@ -1615,6 +1711,36 @@ fn config_event_triggers_reload(event: &notify::Event) -> bool {
         })
 }
 
+fn reload_daemon_config(config: &Mutex<Config>) {
+    match Config::load(None) {
+        Ok(new_cfg) => {
+            if let Ok(mut slot) = config.lock() {
+                *slot = new_cfg;
+            }
+            tracing::debug!("daemon config reloaded");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "daemon-side config load failed, keeping previous");
+        }
+    }
+}
+
+struct ConfigWatchPaths {
+    directories: HashSet<PathBuf>,
+    #[cfg(test)]
+    reconciled: Option<mpsc::Sender<()>>,
+}
+
+impl From<HashSet<PathBuf>> for ConfigWatchPaths {
+    fn from(directories: HashSet<PathBuf>) -> Self {
+        Self {
+            directories,
+            #[cfg(test)]
+            reconciled: None,
+        }
+    }
+}
+
 /// Spawn a thread that watches the global config file and per-project
 /// `.workmux.yaml` files and bumps `config_version` whenever a reload succeeds.
 ///
@@ -1626,8 +1752,8 @@ fn spawn_config_watcher(
     config_version: Arc<AtomicU64>,
     dirty_flag: Arc<AtomicBool>,
     wake_tx: mpsc::SyncSender<()>,
-) -> mpsc::Sender<HashSet<PathBuf>> {
-    let (paths_tx, paths_rx) = mpsc::channel::<HashSet<PathBuf>>();
+) -> mpsc::Sender<ConfigWatchPaths> {
+    let (paths_tx, paths_rx) = mpsc::channel::<ConfigWatchPaths>();
     thread::spawn(move || {
         // Bounded fs event channel; on overflow force a reload.
         let (fs_tx, fs_rx) = mpsc::sync_channel::<notify::Result<notify::Event>>(64);
@@ -1657,7 +1783,7 @@ fn spawn_config_watcher(
         // Track watched directories so we can reconcile add/remove and avoid
         // re-watching the same path twice.
         let mut watched_global: Option<PathBuf> = None;
-        let mut watched_project_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut watched_project_dirs: HashMap<PathBuf, Option<(u64, u64)>> = HashMap::new();
         let mut pending_reload_at: Option<Instant> = None;
         let debounce = Duration::from_millis(200);
 
@@ -1688,10 +1814,23 @@ fn spawn_config_watcher(
 
         while !term.load(Ordering::Relaxed) {
             // 1. Reconcile per-project watches from incoming path sets.
-            while let Ok(new_dirs) = paths_rx.try_recv() {
+            while let Ok(request) = paths_rx.try_recv() {
+                let new_dirs = request.directories;
+                // A watch belongs to a directory inode, not merely its pathname.
+                use std::os::unix::fs::MetadataExt;
+                let identities: HashMap<_, _> = new_dirs
+                    .iter()
+                    .filter_map(|dir| {
+                        let metadata = std::fs::metadata(dir).ok()?;
+                        Some((dir.clone(), (metadata.dev(), metadata.ino())))
+                    })
+                    .collect();
                 let to_remove: Vec<PathBuf> = watched_project_dirs
-                    .difference(&new_dirs)
-                    .cloned()
+                    .iter()
+                    .filter(|(dir, identity)| {
+                        !new_dirs.contains(*dir) || **identity != identities.get(*dir).copied()
+                    })
+                    .map(|(dir, _)| dir.clone())
                     .collect();
                 for dir in &to_remove {
                     // Never unwatch the global config dir, even if it was
@@ -1713,15 +1852,17 @@ fn spawn_config_watcher(
                     );
                     watched_project_dirs.remove(dir);
                 }
+
                 let to_add: Vec<PathBuf> = new_dirs
-                    .difference(&watched_project_dirs)
+                    .iter()
+                    .filter(|dir| !watched_project_dirs.contains_key(*dir))
                     .cloned()
                     .collect();
                 for dir in to_add {
                     // Skip if it's the same as the global watched dir to avoid
                     // double-watching the same path.
                     if Some(&dir) == watched_global.as_ref() {
-                        watched_project_dirs.insert(dir);
+                        watched_project_dirs.insert(dir.clone(), identities.get(&dir).copied());
                         continue;
                     }
                     match watcher.watch(&dir, RecursiveMode::NonRecursive) {
@@ -1733,7 +1874,7 @@ fn spawn_config_watcher(
                                 total = watched_project_dirs.len() + 1,
                                 "fd-leak debug (config)"
                             );
-                            watched_project_dirs.insert(dir);
+                            watched_project_dirs.insert(dir.clone(), identities.get(&dir).copied());
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1743,6 +1884,10 @@ fn spawn_config_watcher(
                             );
                         }
                     }
+                }
+                #[cfg(test)]
+                if let Some(reconciled) = request.reconciled {
+                    let _ = reconciled.send(());
                 }
             }
 
@@ -1777,17 +1922,7 @@ fn spawn_config_watcher(
                 // load (their anchor path may differ from the daemon CWD; a
                 // failure here doesn't necessarily mean clients will fail).
                 // Only update the daemon-side cached Config on success.
-                match Config::load(None) {
-                    Ok(new_cfg) => {
-                        if let Ok(mut slot) = config.lock() {
-                            *slot = new_cfg;
-                        }
-                        tracing::debug!("daemon config reloaded");
-                    }
-                    Err(e) => {
-                        tracing::warn!("daemon-side config load failed, keeping previous: {}", e);
-                    }
-                }
+                reload_daemon_config(&config);
                 let v = config_version.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::info!(version = v, "sidebar config_version bumped");
                 dirty_flag.store(true, Ordering::Relaxed);
@@ -2138,7 +2273,8 @@ pub fn run() -> Result<()> {
     let mut last_client_seen = Instant::now();
     let mut last_agent_list = String::new();
     let mut last_health_log = Instant::now();
-    let mut project_config_cache: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut project_config_cache = ProjectConfigCache::default();
+    let mut seen_config_version = 0;
     let mut last_config_dirs: HashSet<PathBuf> = HashSet::new();
 
     while !term.load(Ordering::Relaxed) {
@@ -2217,6 +2353,28 @@ pub fn run() -> Result<()> {
 
         if publish_pending && let Some((agents, tmux_state)) = &cached_inputs {
             publish_pending = false;
+            let live_paths = agents.iter().map(|agent| agent.path.clone()).collect();
+            let version = config_version.load(Ordering::Relaxed);
+            let invalidated = version != seen_config_version;
+            seen_config_version = version;
+            let resolution = project_config_cache.resolve(
+                &live_paths,
+                now,
+                invalidated,
+                crate::config::discover_project_config,
+            );
+            if resolution.changed {
+                reload_daemon_config(&config);
+                let previous = config_version.fetch_add(1, Ordering::Relaxed);
+                // Do not consume a concurrent watcher invalidation as our own bump.
+                if previous == seen_config_version {
+                    seen_config_version = previous + 1;
+                }
+            }
+            if resolution.reconciled || resolution.directories != last_config_dirs {
+                let _ = config_paths_tx.send(resolution.directories.clone().into());
+                last_config_dirs = resolution.directories;
+            }
             let (
                 position,
                 layout_mode,
@@ -2326,34 +2484,6 @@ pub fn run() -> Result<()> {
                 Vec::new()
             };
             let _ = github_path_tx.send(github_entries);
-
-            let live_paths: HashSet<PathBuf> = output
-                .snapshot
-                .agents
-                .iter()
-                .map(|agent| agent.path.clone())
-                .collect();
-            project_config_cache.retain(|path, _| live_paths.contains(path));
-            let mut config_dirs = HashSet::new();
-            for agent in &output.snapshot.agents {
-                let dir = project_config_cache.get(&agent.path).cloned().or_else(|| {
-                    let found = crate::config::find_project_config(&agent.path)
-                        .ok()
-                        .flatten()
-                        .map(|location| location.config_dir);
-                    if let Some(dir) = &found {
-                        project_config_cache.insert(agent.path.clone(), dir.clone());
-                    }
-                    found
-                });
-                if let Some(dir) = dir {
-                    config_dirs.insert(dir);
-                }
-            }
-            if config_dirs != last_config_dirs {
-                let _ = config_paths_tx.send(config_dirs.clone());
-                last_config_dirs = config_dirs;
-            }
 
             // Navigation reaches live work: an agent nobody is waiting on is
             // not worth a hotkey, folded away or not.
@@ -2632,6 +2762,294 @@ mod tests {
     fn init_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         run_git(path, &["init", "-q"]);
+    }
+
+    #[test]
+    fn project_config_watcher_recovers_registration_and_directory_replacement() {
+        const TEST: &str = "command::sidebar::daemon::tests::project_config_watcher_recovers_registration_and_directory_replacement";
+        if !crate::test_support::is_isolated_child(TEST) {
+            let temp = tempfile::tempdir().unwrap();
+            crate::test_support::run_isolated_test(
+                TEST,
+                temp.path(),
+                &[("HOME", temp.path()), ("XDG_CONFIG_HOME", temp.path())],
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("project");
+        let global = crate::config::global_config_path().unwrap();
+        let global_dir = global.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let term = Arc::new(AtomicBool::new(false));
+        let version = Arc::new(AtomicU64::new(0));
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let paths_tx = spawn_config_watcher(
+            term.clone(),
+            Arc::new(Mutex::new(Config::default())),
+            version.clone(),
+            Arc::new(AtomicBool::new(false)),
+            wake_tx,
+        );
+        let reconcile = |directories| {
+            let (tx, rx) = mpsc::channel();
+            paths_tx
+                .send(ConfigWatchPaths {
+                    directories,
+                    reconciled: Some(tx),
+                })
+                .unwrap();
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("config watch reconciliation did not finish");
+        };
+        let desired = HashSet::from([dir.clone(), global_dir]);
+        // Complete the missing-directory registration attempt before creating it.
+        reconcile(desired.clone());
+        std::fs::create_dir(&dir).unwrap();
+        reconcile(desired.clone());
+        let config_path = dir.join(".workmux.yaml");
+        std::fs::write(&config_path, "agent: first").unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(version.load(Ordering::Relaxed) > 0);
+        std::fs::write(dir.join("temporary"), "agent: atomic").unwrap();
+        std::fs::rename(dir.join("temporary"), &config_path).unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::fs::write(&config_path, "agent: after-atomic").unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::fs::rename(&dir, temp.path().join("old-project")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        reconcile(desired);
+        while wake_rx.try_recv().is_ok() {}
+        let before = version.load(Ordering::Relaxed);
+        std::fs::write(&config_path, "agent: after-directory-replacement").unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(version.load(Ordering::Relaxed) > before);
+        // Removing project membership must not remove the shared global watch.
+        reconcile(HashSet::from([dir]));
+        while wake_rx.try_recv().is_ok() {}
+        let before = version.load(Ordering::Relaxed);
+        std::fs::write(global, "agent: global-reload").unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(version.load(Ordering::Relaxed) > before);
+        term.store(true, Ordering::Relaxed);
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+    }
+
+    #[test]
+    fn project_config_cache_caches_absence_and_deduplicates_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = crate::config::discover_project_config(temp.path()).unwrap();
+        let paths: HashSet<_> = [temp.path().to_path_buf(), temp.path().to_path_buf()].into();
+        let mut cache = ProjectConfigCache::default();
+        let now = Instant::now();
+        let mut calls = 0;
+        for tick in 0..15 {
+            let result = cache.resolve(&paths, now + Duration::from_secs(tick * 2), false, |_| {
+                calls += 1;
+                Ok(absent.clone())
+            });
+            assert!(result.directories.is_empty());
+            assert!(!result.changed);
+        }
+        assert_eq!(
+            calls, 1,
+            "30 agent discoveries across 15 publications become one"
+        );
+        cache.resolve(&paths, now + PROJECT_CONFIG_REVALIDATE, false, |_| {
+            calls += 1;
+            Ok(absent.clone())
+        });
+        assert_eq!(calls, 2);
+        cache.resolve(&HashSet::new(), now, false, |_| unreachable!());
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn project_config_cache_revalidates_files_and_repository_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let paths = HashSet::from([nested.clone()]);
+        let mut cache = ProjectConfigCache::default();
+        let mut now = Instant::now();
+        let first = cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        assert!(first.directories.is_empty());
+        crate::test_support::init_repo(&root);
+        now += PROJECT_CONFIG_REVALIDATE;
+        assert!(
+            cache
+                .resolve(&paths, now, false, crate::config::discover_project_config)
+                .changed
+        );
+        std::fs::write(root.join(".workmux.yml"), "agent: root").unwrap();
+        now += PROJECT_CONFIG_REVALIDATE;
+        let created = cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        assert!(created.changed);
+        assert_eq!(created.directories, HashSet::from([root.clone()]));
+        std::fs::write(nested.join(".workmux.yaml"), "agent: nearer").unwrap();
+        now += PROJECT_CONFIG_REVALIDATE;
+        let nearer = cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        assert!(nearer.changed);
+        assert_eq!(nearer.directories, HashSet::from([nested.clone()]));
+        std::fs::write(nested.join("replacement"), "agent: replaced").unwrap();
+        std::fs::rename(nested.join("replacement"), nested.join(".workmux.yaml")).unwrap();
+        now += PROJECT_CONFIG_REVALIDATE;
+        assert!(
+            cache
+                .resolve(&paths, now, false, crate::config::discover_project_config)
+                .changed
+        );
+        // An external watcher reload already accounts for a deletion/move.
+        std::fs::remove_file(nested.join(".workmux.yaml")).unwrap();
+        let moved = cache.resolve(&paths, now, true, crate::config::discover_project_config);
+        assert!(!moved.changed);
+        assert_eq!(moved.directories, HashSet::from([root.clone()]));
+        std::fs::remove_file(root.join(".workmux.yml")).unwrap();
+        now += PROJECT_CONFIG_REVALIDATE;
+        let deleted = cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        assert!(deleted.changed);
+        assert!(deleted.directories.is_empty());
+        // Replace a repository at identical paths with no config on either side.
+        std::fs::rename(root.join(".git"), root.join("old-git")).unwrap();
+        crate::test_support::init_repo(&root);
+        now += PROJECT_CONFIG_REVALIDATE;
+        assert!(
+            cache
+                .resolve(&paths, now, false, crate::config::discover_project_config)
+                .changed
+        );
+        // A nested repository takes ownership of an unchanged agent path.
+        crate::test_support::init_repo(&nested);
+        now += PROJECT_CONFIG_REVALIDATE;
+        assert!(
+            cache
+                .resolve(&paths, now, false, crate::config::discover_project_config)
+                .changed
+        );
+    }
+
+    #[test]
+    fn project_config_cache_keeps_watches_on_error_and_backs_off() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::test_support::init_repo(repo.path());
+        std::fs::write(repo.path().join(".workmux.yaml"), "agent: test").unwrap();
+        let path = repo.path().canonicalize().unwrap();
+        let paths = HashSet::from([path.clone()]);
+        let observation = crate::config::discover_project_config(&path).unwrap();
+        let now = Instant::now();
+        let mut cache = ProjectConfigCache::default();
+        cache.resolve(&paths, now, false, |_| Ok(observation.clone()));
+        let mut calls = 0;
+        for second in 0..60 {
+            let result = cache.resolve(
+                &paths,
+                now + Duration::from_secs(second),
+                second == 0,
+                |_| {
+                    calls += 1;
+                    anyhow::bail!("recoverable failure")
+                },
+            );
+            assert_eq!(result.directories, paths);
+            assert!(!result.changed);
+        }
+        assert!(calls <= 6, "failure retry calls: {calls}");
+        let recovered = cache.resolve(&paths, now + Duration::from_secs(60), false, |_| {
+            Ok(observation.clone())
+        });
+        assert!(recovered.changed);
+        assert_eq!(cache.entries[&path].failures, 0);
+        assert_eq!(recovered.directories, paths);
+    }
+
+    #[test]
+    fn project_config_cache_revalidates_linked_worktree_reassignment_and_symlinks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let a = fixture.path().join("a");
+        let b = fixture.path().join("b");
+        for repo in [&a, &b] {
+            std::fs::create_dir(repo).unwrap();
+            crate::test_support::init_repo(repo);
+            std::fs::write(repo.join(".workmux.yaml"), "agent: main").unwrap();
+        }
+        let linked = fixture.path().join("linked");
+        crate::test_support::run_git(
+            &a,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let paths = HashSet::from([linked.clone()]);
+        let mut cache = ProjectConfigCache::default();
+        let now = Instant::now();
+        let first = cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        assert_eq!(
+            first.directories,
+            HashSet::from([a.canonicalize().unwrap()])
+        );
+        crate::test_support::run_git(
+            &a,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let failed = cache.resolve(&paths, now, true, crate::config::discover_project_config);
+        assert_eq!(failed.directories, first.directories);
+        crate::test_support::run_git(
+            &b,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let reassigned = cache.resolve(
+            &paths,
+            now + Duration::from_secs(2),
+            false,
+            crate::config::discover_project_config,
+        );
+        assert!(reassigned.changed);
+        assert_eq!(
+            reassigned.directories,
+            HashSet::from([b.canonicalize().unwrap()])
+        );
+        let symlink = fixture.path().join("symlink");
+        std::os::unix::fs::symlink(&a, &symlink).unwrap();
+        let paths = HashSet::from([symlink.clone()]);
+        cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        std::fs::remove_file(&symlink).unwrap();
+        std::os::unix::fs::symlink(&b, &symlink).unwrap();
+        let retargeted = cache.resolve(
+            &paths,
+            now + PROJECT_CONFIG_REVALIDATE,
+            false,
+            crate::config::discover_project_config,
+        );
+        assert!(retargeted.changed);
+        assert_eq!(
+            retargeted.directories,
+            HashSet::from([b.canonicalize().unwrap()])
+        );
+    }
+
+    #[test]
+    fn project_config_cache_independent_repositories_and_shared_watches() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for repo in [&a, &b] {
+            crate::test_support::init_repo(repo.path());
+            std::fs::write(repo.path().join(".workmux.yaml"), "agent: test").unwrap();
+            std::fs::create_dir(repo.path().join("nested")).unwrap();
+        }
+        let a = a.path().canonicalize().unwrap();
+        let b = b.path().canonicalize().unwrap();
+        let now = Instant::now();
+        let mut cache = ProjectConfigCache::default();
+        let paths = HashSet::from([a.clone(), a.join("nested"), b.clone()]);
+        let result = cache.resolve(&paths, now, false, crate::config::discover_project_config);
+        assert_eq!(result.directories, HashSet::from([a.clone(), b]));
+        let result = cache.resolve(
+            &HashSet::from([a.join("nested")]),
+            now,
+            false,
+            |_| unreachable!(),
+        );
+        assert_eq!(result.directories, HashSet::from([a]));
+        assert!(!result.changed);
     }
 
     #[test]
@@ -3310,7 +3728,8 @@ mod tests {
             assert!(refresh_git_status(
                 &parent,
                 &initial[&parent].agent_paths,
-                &cache
+                &cache,
+                &mut crate::git::GitStatusCache::default()
             ));
             assert_eq!(
                 cache.lock().unwrap()[&child].branch.as_deref(),
@@ -3387,7 +3806,8 @@ mod tests {
             assert!(refresh_git_status(
                 &child,
                 &resolved[&child].agent_paths,
-                &cache
+                &cache,
+                &mut crate::git::GitStatusCache::default()
             ));
             assert_eq!(
                 cache.lock().unwrap()[&child].branch.as_deref(),
@@ -3426,7 +3846,8 @@ mod tests {
                 assert!(refresh_git_status(
                     &parent,
                     &merged[&parent].agent_paths,
-                    &cache
+                    &cache,
+                    &mut crate::git::GitStatusCache::default()
                 ));
             }
             assert_eq!(

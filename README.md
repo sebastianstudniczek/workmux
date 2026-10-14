@@ -39,9 +39,16 @@ quick overview.
 
 ![workmux screenshot](https://raw.githubusercontent.com/raine/workmux/refs/heads/main/meta/screenshot_20260329_165534.webp)
 
-> [!TIP]
-> I'm building [aven](https://github.com/raine/aven), a local-first task manager
-> for power users and agents.
+<a href="https://aventasks.dev/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://aventasks.dev/readme/aven-banner-dark.webp">
+    <img src="https://aventasks.dev/readme/aven-banner-light.webp" alt="aven: one task queue for you and your coding agents" width="100%">
+  </picture>
+</a>
+
+<sub>Also from the author of workmux: <a href="https://aventasks.dev/"><b>aven</b></a>, one
+queue for every project, with a keyboard-driven TUI for you and a CLI for your
+agents.</sub>
 
 ## Why workmux?
 
@@ -118,6 +125,10 @@ New to worktrees? See [Why git worktrees?](#why-git-worktrees)
   [Sam Natale on YouTube](https://www.youtube.com/watch?v=ww1wykxJps8)
 
 ## Installation
+
+**Official sources:** [github.com/raine/workmux](https://github.com/raine/workmux)
+and [workmux.raine.dev](https://workmux.raine.dev/). This project is not affiliated
+with workmux.com.
 
 ### Bash YOLO
 
@@ -2173,17 +2184,9 @@ limitations in the Copilot CLI hooks implementation.
 `~/.gemini/config/hooks.json`. `PreInvocation` marks the pane working, and the
 terminal `Stop` event marks it done.
 
-**OpenCode**: download the workmux status plugin:
-
-```bash
-mkdir -p ~/.config/opencode/plugins
-curl -o ~/.config/opencode/package.json \
-  https://raw.githubusercontent.com/raine/workmux/main/resources/opencode/package.json
-curl -o ~/.config/opencode/plugins/workmux-status.ts \
-  https://raw.githubusercontent.com/raine/workmux/main/resources/opencode/plugins/workmux-status.ts
-```
-
-Restart OpenCode for the plugin to take effect.
+**OpenCode**: run `workmux setup --hooks`. For manual installation, see the
+[OpenCode setup guide](https://workmux.raine.dev/guide/status-tracking/#opencode-setup).
+V2 status tracking requires the terminal UI; headless `opencode run` is not tracked.
 
 **Oh My Pi**: copy the workmux status extension to your global OMP extensions directory:
 

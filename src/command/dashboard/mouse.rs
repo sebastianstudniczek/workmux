@@ -9,6 +9,8 @@ use super::app::{
     App, DashboardTab, MouseRowClick, MouseRowId, PaletteCommand, RowContextKind, RowContextMenu,
     ViewMode,
 };
+use super::layout::{dashboard_content_areas, dashboard_outer_areas};
+use crate::config::DashboardLayout;
 
 const TABLE_HEADER_HEIGHT: u16 = 1;
 const SCROLL_LINES: usize = 3;
@@ -416,10 +418,10 @@ fn dashboard_target_at(app: &App, column: u16, row: u16) -> MouseTarget {
         area,
         app.mux.supports_preview(),
         app.preview_size,
+        app.config.dashboard.layout.unwrap_or_default(),
         offset,
         count,
-        column,
-        row,
+        (column, row),
     )
 }
 
@@ -427,11 +429,12 @@ fn dashboard_surface_target(
     area: Rect,
     supports_preview: bool,
     preview_size: u8,
+    layout: DashboardLayout,
     offset: usize,
     count: usize,
-    column: u16,
-    row: u16,
+    position: (u16, u16),
 ) -> MouseTarget {
+    let (column, row) = position;
     let outer = dashboard_outer_areas(area);
     if row == outer[0].y {
         if (area.x + 2..area.x + 8).contains(&column) {
@@ -443,7 +446,7 @@ fn dashboard_surface_target(
     }
 
     let (table_area, preview_area) =
-        dashboard_content_areas(outer[1], supports_preview, preview_size);
+        dashboard_content_areas(outer[1], supports_preview, preview_size, layout);
     if contains(table_area, column, row) {
         let body_y = table_area.y.saturating_add(TABLE_HEADER_HEIGHT);
         if row >= body_y {
@@ -459,32 +462,6 @@ fn dashboard_surface_target(
     }
 
     MouseTarget::None
-}
-
-fn dashboard_outer_areas(area: Rect) -> std::rc::Rc<[Rect]> {
-    Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .split(area)
-}
-
-fn dashboard_content_areas(
-    content: Rect,
-    supports_preview: bool,
-    preview_size: u8,
-) -> (Rect, Option<Rect>) {
-    if !supports_preview {
-        return (content, None);
-    }
-    let table_size = 100u16.saturating_sub(preview_size as u16);
-    let chunks = Layout::vertical([
-        Constraint::Fill(table_size),
-        Constraint::Fill(preview_size as u16),
-    ])
-    .split(content);
-    (chunks[0], Some(chunks[1]))
 }
 
 fn dashboard_footer_target(app: &App, column: u16) -> MouseTarget {
@@ -504,7 +481,11 @@ fn dashboard_footer_target(app: &App, column: u16) -> MouseTarget {
             );
         }
         DashboardTab::Agents if app.input_mode => {
-            return input_footer_target(app.terminal_area.x, column);
+            return input_footer_target(
+                app.terminal_area.x,
+                column,
+                &app.config.dashboard.input_exit_key().to_string(),
+            );
         }
         DashboardTab::Worktrees if app.worktree_filter_active => {
             return filter_footer_target(
@@ -535,9 +516,11 @@ fn filter_footer_target(start: u16, column: u16, filter_width: usize) -> MouseTa
     }
 }
 
-fn input_footer_target(start: u16, column: u16) -> MouseTarget {
+fn input_footer_target(start: u16, column: u16, exit_key: &str) -> MouseTarget {
     const EXIT_START: u16 = 43;
-    if (start + EXIT_START..start + EXIT_START + 8).contains(&column) {
+    if (start + EXIT_START..start + EXIT_START + UnicodeWidthStr::width(exit_key) as u16 + 5)
+        .contains(&column)
+    {
         MouseTarget::Action(Action::ExitInputMode)
     } else {
         MouseTarget::None
@@ -802,15 +785,15 @@ mod tests {
         let area = Rect::new(0, 0, 100, 24);
 
         assert_eq!(
-            dashboard_surface_target(area, true, 40, 7, 20, 3, 0),
+            dashboard_surface_target(area, true, 40, DashboardLayout::Stacked, 7, 20, (3, 0)),
             MouseTarget::Tab(DashboardTab::Agents)
         );
         assert_eq!(
-            dashboard_surface_target(area, true, 40, 7, 20, 12, 0),
+            dashboard_surface_target(area, true, 40, DashboardLayout::Stacked, 7, 20, (12, 0)),
             MouseTarget::Tab(DashboardTab::Worktrees)
         );
         assert_eq!(
-            dashboard_surface_target(area, true, 40, 7, 20, 4, 3),
+            dashboard_surface_target(area, true, 40, DashboardLayout::Stacked, 7, 20, (4, 3)),
             MouseTarget::Row(7)
         );
     }
@@ -820,8 +803,29 @@ mod tests {
         let area = Rect::new(0, 0, 100, 24);
 
         assert_eq!(
-            dashboard_surface_target(area, true, 50, 0, 10, 20, 18),
+            dashboard_surface_target(area, true, 50, DashboardLayout::Stacked, 0, 10, (20, 18)),
             MouseTarget::Preview
+        );
+    }
+
+    #[test]
+    fn side_by_side_preview_and_rows_are_hit_tested() {
+        let area = Rect::new(0, 0, 100, 24);
+        assert_eq!(
+            dashboard_surface_target(area, true, 60, DashboardLayout::SideBySide, 7, 30, (20, 3)),
+            MouseTarget::Preview
+        );
+        assert_eq!(
+            dashboard_surface_target(area, true, 60, DashboardLayout::SideBySide, 7, 30, (70, 3)),
+            MouseTarget::Row(7)
+        );
+        assert_eq!(
+            dashboard_surface_target(area, true, 60, DashboardLayout::SideBySide, 7, 30, (70, 20)),
+            MouseTarget::Row(24)
+        );
+        assert_eq!(
+            dashboard_surface_target(area, false, 60, DashboardLayout::SideBySide, 7, 30, (20, 3)),
+            MouseTarget::Row(7)
         );
     }
 
@@ -854,6 +858,26 @@ mod tests {
             footer_target_at(2, 22, &items),
             MouseTarget::Action(Action::Quit)
         );
+    }
+
+    #[test]
+    fn input_footer_exit_target_tracks_key_label_width() {
+        for label in ["Esc", "Ctrl+q"] {
+            let start = 10;
+            let first = start + 43;
+            let end = first + UnicodeWidthStr::width(label) as u16 + 5;
+            assert_eq!(
+                input_footer_target(start, first - 1, label),
+                MouseTarget::None
+            );
+            for column in first..end {
+                assert_eq!(
+                    input_footer_target(start, column, label),
+                    MouseTarget::Action(Action::ExitInputMode)
+                );
+            }
+            assert_eq!(input_footer_target(start, end, label), MouseTarget::None);
+        }
     }
 
     #[test]

@@ -686,6 +686,16 @@ impl SidebarApp {
         if let Some(idx) = self.host_agent_idx {
             self.select_agent(Some(idx));
         }
+        *self.list_state.offset_mut() = 0;
+        self.first_visible_agent_idx = 0;
+    }
+
+    /// Automatic host highlighting does not move the viewport away from the top.
+    pub(super) fn viewport_selection(&self) -> Option<usize> {
+        match self.selection_mode {
+            SelectionMode::FollowHost => None,
+            SelectionMode::Manual => self.list_state.selected(),
+        }
     }
 
     /// Re-read the merged config from disk and apply live presentation fields.
@@ -1303,7 +1313,7 @@ impl SidebarApp {
     }
 
     pub fn ensure_selected_visible(&mut self, visible_count: usize) {
-        let Some(selected) = self.list_state.selected() else {
+        let Some(selected) = self.viewport_selection() else {
             return;
         };
         if selected < self.first_visible_agent_idx {
@@ -2400,12 +2410,45 @@ mod tests {
     }
 
     #[test]
+    fn active_agent_pane_resets_sidebar_viewport() {
+        let mut app = selection_app();
+        app.select_index(1);
+        *app.list_state.offset_mut() = 1;
+        app.first_visible_agent_idx = 1;
+
+        app.apply_snapshot(selection_snapshot(&["%host-agent"]));
+
+        assert_eq!(app.list_state.offset(), 0);
+        assert_eq!(app.first_visible_agent_idx, 0);
+        assert_eq!(app.viewport_selection(), None);
+    }
+
+    #[test]
+    fn returning_to_agent_window_resets_sidebar_viewport() {
+        let mut app = selection_app();
+        app.select_index(1);
+        *app.list_state.offset_mut() = 1;
+        let mut inactive = selection_snapshot(&["%other-agent"]);
+        inactive.active_windows.clear();
+        app.apply_snapshot(inactive);
+        assert_eq!(app.list_state.offset(), 1);
+
+        app.apply_snapshot(selection_snapshot(&["%host-agent"]));
+
+        assert_eq!(app.list_state.offset(), 0);
+        assert_eq!(app.selection_mode, SelectionMode::FollowHost);
+    }
+
+    #[test]
     fn active_sidebar_pane_preserves_manual_selection() {
         let mut app = selection_app();
         app.select_index(1);
 
+        *app.list_state.offset_mut() = 1;
         app.apply_snapshot(selection_snapshot(&["%sidebar"]));
 
+        assert_eq!(app.list_state.offset(), 1);
+        assert_eq!(app.viewport_selection(), Some(1));
         assert_eq!(app.list_state.selected(), Some(1));
         assert_eq!(app.selection_mode, SelectionMode::Manual);
     }

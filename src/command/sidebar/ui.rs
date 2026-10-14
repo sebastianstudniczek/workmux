@@ -1209,7 +1209,7 @@ fn render_compact_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
         .collect();
 
     // Own the offset so the sticky header describes this frame, not the last.
-    let selected = app.list_state.selected().unwrap_or(0);
+    let selected = app.viewport_selection().unwrap_or(0);
     let height = area.height as usize;
     let full_start = compact_offset(app.list_state.offset(), selected, height);
 
@@ -1262,7 +1262,17 @@ fn render_compact_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
         .scroll_padding(0)
         .highlight_style(Style::default().bg(app.palette.highlight_row_bg));
 
-    f.render_stateful_widget(list, list_area, &mut app.list_state);
+    render_list(f, app, list, list_area);
+}
+
+/// Keep host highlighting independent of ratatui's selection-driven scrolling.
+fn render_list(f: &mut Frame, app: &mut SidebarApp, list: List<'_>, area: Rect) {
+    let selected = app.list_state.selected();
+    if app.viewport_selection().is_none() {
+        app.list_state.select(None);
+    }
+    f.render_stateful_widget(list, area, &mut app.list_state);
+    app.list_state.select(selected);
 }
 
 /// Fully visible tiles and the space reserved for their overflow indicator.
@@ -1574,7 +1584,7 @@ fn render_tile_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
 
     let heights: Vec<_> = items.iter().map(ListItem::height).collect();
     app.tile_heights.clone_from(&heights);
-    let selected_row = app.list_state.selected().unwrap_or(app.list_state.offset());
+    let selected_row = app.viewport_selection().unwrap_or(0);
     let full_height = area.height as usize;
     let full_view = tile_viewport(&heights, app.list_state.offset(), selected_row, full_height);
 
@@ -1644,7 +1654,7 @@ fn render_tile_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
 
     // Selection backgrounds belong to tile content, not separators or the footer.
     let list = List::new(items).scroll_padding(0);
-    f.render_stateful_widget(list, list_area, &mut app.list_state);
+    render_list(f, app, list, list_area);
 
     if let Some(view) = viewport.filter(|view| view.more) {
         // Count agents, including the ones a collapsed toggle stands for,
@@ -1837,9 +1847,43 @@ mod tests {
             });
         }
         app.rebuild_rows();
-        app.list_state.select(Some(0));
+        app.select_index(0);
         app.host_agent_idx = Some(5);
         app
+    }
+
+    #[test]
+    fn host_highlight_keeps_viewport_at_top_until_manual_navigation() {
+        for mode in [SidebarLayoutMode::Compact, SidebarLayoutMode::Tiles] {
+            let mut app = SidebarApp::test_with_template_error(TemplateError {
+                location: String::new(),
+                message: String::new(),
+            });
+            app.template_error = None;
+            app.layout_mode = mode;
+            app.agents = tile_fixture().agents;
+            app.rebuild_rows();
+            app.host_agent_idx = Some(5);
+            *app.list_state.offset_mut() = 4;
+            app.sync_selection();
+
+            let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+            for _ in 0..2 {
+                terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+                assert_eq!(app.list_state.offset(), 0, "{mode:?}");
+                assert_eq!(app.selected_agent_idx(), Some(5));
+                assert!((0..5).any(|y| {
+                    buffer_row(terminal.backend().buffer(), y).contains("auth-refresh")
+                }));
+            }
+
+            app.select_index(5);
+            terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+            assert!(app.list_state.offset() > 0, "{mode:?}");
+            assert!((0..5).any(|y| {
+                buffer_row(terminal.backend().buffer(), y).contains("sidebar-groups")
+            }));
+        }
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {

@@ -72,14 +72,15 @@ pub fn list_in(
         return Err(anyhow!("Not in a git repository"));
     }
 
-    let worktrees_data = git::list_worktrees_in(repo)?;
+    let listing = git::list_worktrees_with_main_in(repo)?;
+    let main_worktree_path = listing.main_path;
+    let worktrees_data = listing.worktrees;
 
     if worktrees_data.is_empty() {
         return Ok(Vec::new());
     }
 
-    // The first worktree from `git worktree list` is always the main worktree
-    let main_worktree_path = worktrees_data.first().map(|(p, _)| p.clone());
+    let repo_key = git::get_repository_key_in(repo)?;
 
     // Apply filter early before expensive operations
     let worktrees_data = filter_worktrees(worktrees_data, filter);
@@ -236,15 +237,14 @@ pub fn list_in(
                 })
             };
 
-            let is_main = main_worktree_path
-                .as_ref()
-                .is_some_and(|main_path| *main_path == path);
+            let is_main = main_worktree_path == path;
 
             let created_at = crate::creation_time::filesystem_birth_time(&path);
 
             let base_branch = git::get_branch_base_in(&branch, repo).ok();
 
             WorktreeInfo {
+                repo_key: repo_key.clone(),
                 handle,
                 branch,
                 path,

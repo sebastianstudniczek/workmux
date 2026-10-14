@@ -17,6 +17,24 @@ use super::super::sort::WorktreeSortMode;
 use super::App;
 use super::types::*;
 
+fn merge_worktree_prs(
+    worktrees: &mut [workflow::types::WorktreeInfo],
+    statuses: &std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<String, crate::github::PrSummary>,
+    >,
+) {
+    for wt in worktrees {
+        if wt.pr_info.is_some() || wt.is_main {
+            continue;
+        }
+        wt.pr_info = statuses
+            .get(&wt.repo_key)
+            .and_then(|prs| prs.get(&wt.branch))
+            .cloned();
+    }
+}
+
 /// Delete the last word from a string (Emacs Ctrl+w behavior).
 fn delete_word_backward(s: &mut String) {
     // Trim trailing whitespace first
@@ -269,25 +287,7 @@ impl App {
 
         // Merge PR data from dashboard's own PR fetching into worktrees
         // (workflow::list is called with fetch_pr_status=false to avoid spinner)
-        if !self.pr_statuses.is_empty() {
-            let all_worktrees = &self.all_worktrees;
-            let pr_statuses = &self.pr_statuses;
-            for wt in &mut self.worktrees {
-                if wt.pr_info.is_some() || wt.is_main {
-                    continue;
-                }
-                let Some(repo_root) = super::agents::repo_root_for_worktree(all_worktrees, wt)
-                else {
-                    continue;
-                };
-                if let Some(pr) = pr_statuses
-                    .get(repo_root)
-                    .and_then(|prs| prs.get(&wt.branch))
-                {
-                    wt.pr_info = Some(pr.clone());
-                }
-            }
-        }
+        merge_worktree_prs(&mut self.worktrees, &self.pr_statuses);
 
         // Apply name filter
         if !self.worktree_filter_text.is_empty() {
@@ -1380,5 +1380,103 @@ impl App {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MuxMode;
+    use crate::github::{ClosingIssue, PrSummary};
+    use crate::workflow::types::WorktreeInfo;
+    use std::collections::HashMap;
+
+    fn worktree(repo: &str, name: &str, is_main: bool) -> WorktreeInfo {
+        WorktreeInfo {
+            repo_key: format!("{repo}/.git").into(),
+            handle: name.into(),
+            branch: name.into(),
+            path: format!("{repo}/worktrees/{name}").into(),
+            is_main,
+            mode: MuxMode::Window,
+            has_mux_window: false,
+            has_unmerged: false,
+            pr_info: None,
+            agent_status: None,
+            created_at: None,
+            base_branch: None,
+        }
+    }
+
+    fn pr(number: u32) -> PrSummary {
+        PrSummary {
+            number,
+            title: format!("PR {number}"),
+            state: "OPEN".into(),
+            is_draft: false,
+            checks: None,
+            check_meta: None,
+            url: None,
+            closing_issues: vec![ClosingIssue {
+                number: 201,
+                repository: "test/project".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn bare_worktree_prs_survive_first_checkout_removal() {
+        let first = worktree("/project", "branch-1", false);
+        let second = worktree("/project", "branch-2", false);
+        let statuses = HashMap::from([(
+            first.repo_key.clone(),
+            HashMap::from([
+                (first.branch.clone(), pr(101)),
+                (second.branch.clone(), pr(102)),
+            ]),
+        )]);
+        let mut rows = vec![first, second.clone()];
+        merge_worktree_prs(&mut rows, &statuses);
+        assert_eq!(rows[0].pr_info, Some(pr(101)));
+        assert_eq!(rows[1].pr_info, Some(pr(102)));
+        let mut refreshed = vec![second];
+        merge_worktree_prs(&mut refreshed, &statuses);
+        assert_eq!(refreshed[0].pr_info, Some(pr(102)));
+    }
+
+    #[test]
+    fn matching_project_and_branch_names_do_not_mix_prs() {
+        let mut rows = vec![
+            worktree("/a/project", "feature", false),
+            worktree("/b/project", "feature", false),
+        ];
+        let statuses = HashMap::from([
+            (
+                rows[0].repo_key.clone(),
+                HashMap::from([("feature".into(), pr(101))]),
+            ),
+            (
+                rows[1].repo_key.clone(),
+                HashMap::from([("feature".into(), pr(102))]),
+            ),
+        ]);
+        merge_worktree_prs(&mut rows, &statuses);
+        assert_eq!(rows[0].pr_info, Some(pr(101)));
+        assert_eq!(rows[1].pr_info, Some(pr(102)));
+    }
+
+    #[test]
+    fn ordinary_main_checkout_keeps_existing_pr_suppression() {
+        let mut rows = vec![
+            worktree("/project", "main", true),
+            worktree("/project", "feature", false),
+        ];
+        let statuses = HashMap::from([(
+            rows[0].repo_key.clone(),
+            HashMap::from([("main".into(), pr(101)), ("feature".into(), pr(102))]),
+        )]);
+        merge_worktree_prs(&mut rows, &statuses);
+        assert_eq!(rows[0].pr_info, None);
+        assert_eq!(rows[1].pr_info, Some(pr(102)));
     }
 }

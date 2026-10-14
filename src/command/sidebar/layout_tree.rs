@@ -10,9 +10,15 @@
 //!
 //! The checksum is a 4-char hex value (tmux's rotate-right-and-add algorithm).
 //!
-//! This module parses the layout string into a tree, allows surgical width
-//! reflow after sidebar creation, and serializes back for `select-layout`.
+//! Since 3.8, tmux reports layouts in a JSON (v2) format instead:
+//!   `{"V":2,"L":{"t":"h","w":W,"h":H,"x":X,"y":Y,"c":[...]}}`
+//! and still accepts the legacy format above as `select-layout` input.
+//!
+//! This module parses either format into a tree, allows surgical width
+//! reflow after sidebar creation, and serializes back to the legacy format
+//! for `select-layout`.
 
+use serde::Deserialize;
 use tracing::debug;
 
 use crate::cmd::Cmd;
@@ -171,8 +177,105 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Parse a tmux layout string (including checksum prefix) into a tree.
+/// Parse a tmux layout string, in either the JSON (v2) or the legacy
+/// checksum-prefixed format, into a tree.
 fn parse_layout(layout: &str) -> Option<LayoutNode> {
+    if layout.starts_with('{') {
+        parse_json_layout(layout)
+    } else {
+        parse_legacy_layout(layout)
+    }
+}
+
+/// Top level of a JSON (v2) layout string.
+#[derive(Deserialize)]
+struct JsonLayout {
+    #[serde(rename = "V")]
+    version: u32,
+    #[serde(rename = "L")]
+    root: JsonCell,
+}
+
+#[derive(Deserialize)]
+enum JsonCellType {
+    #[serde(rename = "h")]
+    Horizontal,
+    #[serde(rename = "v")]
+    Vertical,
+    #[serde(rename = "p")]
+    Pane,
+}
+
+/// A JSON (v2) layout cell. Fields the reflow does not use (active, last and
+/// pane index) are ignored.
+#[derive(Deserialize)]
+struct JsonCell {
+    t: JsonCellType,
+    w: u16,
+    h: u16,
+    x: i32,
+    y: i32,
+    #[serde(default)]
+    c: Vec<JsonCell>,
+    /// Pane ID as `%n`; present on pane cells.
+    #[serde(rename = "I")]
+    pane_id: Option<String>,
+    /// Z-index; present only on floating panes.
+    z: Option<u32>,
+}
+
+impl JsonCell {
+    fn is_floating(&self) -> bool {
+        self.z.is_some()
+    }
+}
+
+fn parse_json_layout(layout: &str) -> Option<LayoutNode> {
+    let parsed: JsonLayout = serde_json::from_str(layout).ok()?;
+    if parsed.version != 2 {
+        return None;
+    }
+    json_cell_to_node(parsed.root)
+}
+
+/// Convert a JSON cell into a layout node, dropping floating panes: they sit
+/// outside the tiled tree, cannot be expressed in the legacy format, and tmux
+/// leaves them in place when a legacy layout is applied.
+fn json_cell_to_node(cell: JsonCell) -> Option<LayoutNode> {
+    let rect = Rect {
+        w: cell.w,
+        h: cell.h,
+        x: u16::try_from(cell.x).ok()?,
+        y: u16::try_from(cell.y).ok()?,
+    };
+    match cell.t {
+        JsonCellType::Pane => {
+            let pane_id = cell.pane_id?.strip_prefix('%')?.parse().ok()?;
+            Some(LayoutNode::Leaf { rect, pane_id })
+        }
+        JsonCellType::Horizontal => Some(LayoutNode::HSplit {
+            rect,
+            children: json_tiled_children(cell.c)?,
+        }),
+        JsonCellType::Vertical => Some(LayoutNode::VSplit {
+            rect,
+            children: json_tiled_children(cell.c)?,
+        }),
+    }
+}
+
+/// Convert the tiled children of a split cell. A split must keep at least one.
+fn json_tiled_children(cells: Vec<JsonCell>) -> Option<Vec<LayoutNode>> {
+    let children = cells
+        .into_iter()
+        .filter(|cell| !cell.is_floating())
+        .map(json_cell_to_node)
+        .collect::<Option<Vec<_>>>()?;
+    (!children.is_empty()).then_some(children)
+}
+
+/// Parse a legacy layout string (including checksum prefix) into a tree.
+fn parse_legacy_layout(layout: &str) -> Option<LayoutNode> {
     // Skip "XXXX," checksum prefix
     let body = layout.get(5..)?;
     if layout.as_bytes().get(4).copied().is_none_or(|b| b != b',') {
@@ -427,6 +530,7 @@ pub(super) fn reflow_after_sidebar_add(
             return;
         }
     };
+    let original_root = root.clone();
 
     let axis = Axis::for_position(position);
     if !axis.root_matches(&root) {
@@ -507,11 +611,13 @@ pub(super) fn reflow_after_sidebar_add(
         pos = pos.saturating_add(new_len).saturating_add(1);
     }
 
-    let new_layout = serialize_layout(&root);
-    if new_layout == layout_str {
+    // Compare trees rather than strings: tmux may report the layout in a
+    // different format from the one serialized here.
+    if root == original_root {
         debug!(window_id, "reflow: layout already matches");
         return;
     }
+    let new_layout = serialize_layout(&root);
 
     debug!(
         window_id,
@@ -784,6 +890,54 @@ mod tests {
                 parse_layout(layout).unwrap_or_else(|| panic!("failed to parse: {}", layout));
             let result = serialize_layout(&node);
             assert_eq!(result, layout, "roundtrip failed");
+        }
+    }
+
+    /// The same tmux 3.8 window captured in the JSON format (normal clients)
+    /// and the legacy format (control-mode clients): sidebar, content pane,
+    /// and a vertically split content column.
+    const JSON_SIDEBAR_WITH_VSPLIT: &str = r#"{"V":2,"L":{"t":"h","w":548,"h":108,"x":0,"y":0,"c":[{"t":"p","w":40,"h":108,"x":0,"y":0,"l":2,"i":0,"I":"%0"},{"t":"p","w":370,"h":108,"x":41,"y":0,"l":1,"i":1,"I":"%1"},{"t":"v","w":136,"h":108,"x":412,"y":0,"c":[{"t":"p","w":136,"h":54,"x":412,"y":0,"l":0,"i":2,"I":"%2"},{"t":"p","w":136,"h":53,"x":412,"y":55,"a":true,"i":3,"I":"%3"}]}]}}"#;
+    const LEGACY_SIDEBAR_WITH_VSPLIT: &str = "3e38,548x108,0,0{40x108,0,0,0,370x108,41,0,1,136x108,412,0[136x54,412,0,2,136x53,412,55,3]}";
+
+    #[test]
+    fn test_parse_json_layout_matches_legacy() {
+        let json = parse_layout(JSON_SIDEBAR_WITH_VSPLIT).expect("JSON layout parses");
+        let legacy = parse_layout(LEGACY_SIDEBAR_WITH_VSPLIT).expect("legacy layout parses");
+        assert_eq!(json, legacy);
+        assert_eq!(serialize_layout(&json), LEGACY_SIDEBAR_WITH_VSPLIT);
+    }
+
+    #[test]
+    fn test_parse_json_layout_drops_floating_panes() {
+        // Same window with a floating pane (z-index set) opened over it; tmux
+        // nests it under the active pane's parent and omits it from the legacy
+        // format.
+        let with_floating = r#"{"V":2,"L":{"t":"h","w":548,"h":108,"x":0,"y":0,"c":[{"t":"p","w":40,"h":108,"x":0,"y":0,"l":3,"i":0,"I":"%0"},{"t":"p","w":370,"h":108,"x":41,"y":0,"l":2,"i":1,"I":"%1"},{"t":"v","w":136,"h":108,"x":412,"y":0,"c":[{"t":"p","w":136,"h":54,"x":412,"y":0,"l":1,"i":2,"I":"%2"},{"t":"p","w":136,"h":53,"x":412,"y":55,"l":0,"i":3,"I":"%3"},{"t":"p","w":274,"h":27,"x":4,"y":2,"a":true,"i":4,"z":0,"I":"%4"}]}]}}"#;
+        let node = parse_layout(with_floating).expect("JSON layout parses");
+        assert_eq!(serialize_layout(&node), LEGACY_SIDEBAR_WITH_VSPLIT);
+    }
+
+    #[test]
+    fn test_parse_json_layout_single_pane() {
+        let layout =
+            r#"{"V":2,"L":{"t":"p","w":373,"h":79,"x":0,"y":0,"a":true,"i":0,"I":"%640"}}"#;
+        assert_eq!(parse_layout(layout), Some(leaf(373, 79, 0, 0, 640)));
+    }
+
+    #[test]
+    fn test_parse_json_layout_rejects_unsupported_input() {
+        let unsupported = [
+            // Unknown format version
+            r#"{"V":3,"L":{"t":"p","w":80,"h":24,"x":0,"y":0,"I":"%1"}}"#,
+            // Pane cell without a pane ID
+            r#"{"V":2,"L":{"t":"p","w":80,"h":24,"x":0,"y":0}}"#,
+            // Split whose only child is floating
+            r#"{"V":2,"L":{"t":"h","w":80,"h":24,"x":0,"y":0,"c":[{"t":"p","w":20,"h":10,"x":2,"y":2,"z":0,"I":"%1"}]}}"#,
+            // Truncated
+            r#"{"V":2,"L":{"t":"h","w":80"#,
+        ];
+        for layout in unsupported {
+            assert_eq!(parse_layout(layout), None, "should reject: {}", layout);
         }
     }
 

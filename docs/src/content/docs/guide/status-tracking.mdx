@@ -116,13 +116,19 @@ Restart omp for the extension to take effect.
 
 ## OpenCode setup
 
-If you prefer manual setup, download the workmux status plugin to your global OpenCode plugin directory:
+OpenCode V2 status tracking requires the terminal UI; headless `opencode run` is not tracked.
+
+For manual setup:
 
 ```bash
-mkdir -p ~/.config/opencode/plugins
-curl -o ~/.config/opencode/plugins/workmux-status.ts \
-  https://raw.githubusercontent.com/raine/workmux/main/resources/opencode/plugins/workmux-status.ts
+mkdir -p ~/.config/opencode/plugins/workmux-status
+for file in index.ts tui.ts status.ts; do
+  curl -fsSL -o "$HOME/.config/opencode/plugins/workmux-status/$file" \
+    "https://raw.githubusercontent.com/raine/workmux/main/resources/opencode/v2/workmux-status/$file"
+done
 ```
+
+When switching versions manually, back up any local edits and remove the other version's workmux plugin: `plugins/workmux-status.ts` (or `plugin/workmux-status.ts`) for V1, `plugins/workmux-status/` for V2.
 
 Restart OpenCode for the plugin to take effect.
 

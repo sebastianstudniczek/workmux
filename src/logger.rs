@@ -4,12 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_appender::rolling;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::sandbox::guest::is_sandbox_guest;
+
+// Bound the eagerly allocated queue while retaining room for log bursts.
+// A full queue drops new logs rather than blocking the caller.
+const LOG_BUFFERED_LINES_LIMIT: usize = 4096;
 
 static INIT: OnceLock<()> = OnceLock::new();
 static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
@@ -41,7 +45,10 @@ fn init_inner() -> Result<()> {
 
     let (directory, file_name) = split_path(&log_path)?;
     let file_appender = rolling::never(directory, file_name);
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(LOG_BUFFERED_LINES_LIMIT)
+        .lossy(true)
+        .finish(file_appender);
     let _ = GUARD.set(guard);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

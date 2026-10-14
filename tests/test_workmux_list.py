@@ -629,3 +629,52 @@ def test_list_all_json_aggregates_repositories_and_agent_statuses(
     assert by_path[str(second.worktree)]["agent_statuses"] == ["done"]
     assert by_path[str(first.worktree)]["project"] == mux_repo_path.name
     assert by_path[str(second.worktree)]["project"] == second_repo.name
+
+
+@pytest.mark.parametrize("git_dir", [".git", ".bare"])
+def test_list_json_bare_repository_has_no_main_checkout(
+    mux_server: MuxEnvironment, workmux_exe_path: Path, git_dir: str
+):
+    env = mux_server
+    project = env.tmp_path / "bare-project"
+    project.mkdir()
+    bare = project / git_dir
+    env.run_command(["git", "init", "--bare", str(bare)])
+    env.run_command(["git", "config", "user.name", "Test User"], cwd=bare)
+    env.run_command(["git", "config", "user.email", "test@example.com"], cwd=bare)
+    dev = project / "worktrees" / "dev"
+    env.run_command(["git", "worktree", "add", "-b", "dev", str(dev)], cwd=bare)
+    env.run_command(["git", "commit", "--allow-empty", "-m", "Initial commit"], cwd=dev)
+    write_workmux_config(dev, env=env)
+    for branch in ["branch-1", "branch-2"]:
+        env.run_command(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(project / "worktrees" / branch),
+                "dev",
+            ],
+            cwd=bare,
+        )
+
+    def check_listing(expected_branches: set[str], args: str = "--json"):
+        output = run_workmux_list(env, workmux_exe_path, dev, args)
+        rows = json.loads(output)
+        assert {row["branch"] for row in rows} == expected_branches
+        assert all(row["is_main"] is False for row in rows)
+        # Git treats a bare .git directory as the parent project's anchor.
+        anchor = project if git_dir == ".git" else bare
+        assert all(
+            Path(row["project_path"]).resolve() == anchor.resolve() for row in rows
+        )
+
+    check_listing({"branch-1", "branch-2", "dev"})
+    check_listing({"branch-2"}, "--json branch-2")
+    env.run_command(
+        ["git", "worktree", "remove", str(project / "worktrees" / "branch-1")],
+        cwd=bare,
+    )
+    check_listing({"branch-2", "dev"})

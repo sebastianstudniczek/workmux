@@ -39,12 +39,23 @@ pub fn get_repo_root_if_present() -> Result<Option<PathBuf>> {
 }
 
 pub fn get_repo_root_if_present_in(workdir: Option<&Path>) -> Result<Option<PathBuf>> {
+    repository_path_if_present(workdir, "--git-dir")
+}
+
+/// Resolve a worktree root, distinguishing absent repositories from failed probes.
+pub(crate) fn worktree_root_if_present(path: &Path) -> Result<Option<PathBuf>> {
+    repository_path_if_present(Some(path), "--show-toplevel")
+}
+
+fn repository_path_if_present(workdir: Option<&Path>, argument: &str) -> Result<Option<PathBuf>> {
     let cwd = match workdir {
-        Some(path) => path.to_path_buf(),
+        Some(path) => path
+            .canonicalize()
+            .context("Failed to resolve repository path")?,
         None => std::env::current_dir().context("Failed to resolve current directory")?,
     };
     let output = super::unattended_git(Some(&cwd))?
-        .args(["rev-parse", "--git-dir"])
+        .args(["rev-parse", argument])
         .output()
         .context("Failed to execute git rev-parse")?;
 
@@ -169,9 +180,33 @@ pub fn get_git_common_dir_in(workdir: Option<&Path>) -> Result<PathBuf> {
     Ok(abs_path)
 }
 
+/// Stable repository identity shared by all linked worktrees and status caches.
+pub fn get_repository_key_in(workdir: Option<&Path>) -> Result<PathBuf> {
+    get_git_common_dir_in(workdir).map(|path| crate::util::canon_or_self(&path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_key_is_shared_by_primary_linked_and_nested_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("project");
+        std::fs::create_dir(&repo).unwrap();
+        crate::test_support::init_repo(&repo);
+        let linked = temp.path().join("feature");
+        crate::test_support::run_git(
+            &repo,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        let nested = linked.join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let expected = repo.join(".git").canonicalize().unwrap();
+        for path in [&repo, &linked, &nested] {
+            assert_eq!(get_repository_key_in(Some(path)).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn repository_probe_confirms_non_repository() {
