@@ -819,6 +819,33 @@ mod tests {
     }
 
     #[test]
+    fn grouped_completion_stays_visible_and_numbered_until_acknowledged() {
+        let mut done = agent("/tmp/api__worktrees/done");
+        done.status = Some(AgentStatus::Done);
+        done.activity_ts = Some(1);
+        done.status_ts = Some(1);
+
+        let snapshot = build_snapshot(SnapshotInputs {
+            agents: vec![done.clone()],
+            group_by: Some(SidebarGroupBy::Project),
+            collapse_stale: true,
+            ..Default::default()
+        });
+        assert!(!snapshot.stale_pane_ids.contains(&done.pane_id));
+        assert!(is_jump_target(&snapshot, &done));
+
+        done.status = None;
+        let snapshot = build_snapshot(SnapshotInputs {
+            agents: vec![done.clone()],
+            group_by: Some(SidebarGroupBy::Project),
+            collapse_stale: true,
+            ..Default::default()
+        });
+        assert!(snapshot.stale_pane_ids.contains(&done.pane_id));
+        assert!(!is_jump_target(&snapshot, &done));
+    }
+
+    #[test]
     fn configured_threshold_drives_snapshot_staleness() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

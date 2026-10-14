@@ -50,6 +50,12 @@ pub fn persist_agent_update(
     agent_session_id: Option<String>,
     prompt: PromptUpdate,
 ) {
+    if status == Some(AgentStatus::Working) && mux.name() == "tmux" {
+        let tmux = crate::multiplexer::TmuxBackend::for_socket(&mux.instance_id());
+        if let Err(error) = tmux.wake_agent(pane_id) {
+            warn!(%pane_id, %error, "failed to clear agent sleep state");
+        }
+    }
     persist_agent_snapshot(
         mux,
         pane_id,

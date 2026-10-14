@@ -494,6 +494,23 @@ impl TmuxBackend {
             .map(|value| nonempty(value.trim()))
     }
 
+    /// Remove a pane's manual sleep flag when the agent starts working again.
+    pub(crate) fn wake_agent(&self, pane_id: &str) -> Result<()> {
+        let Some(value) = self.global_option("@workmux_sleeping_panes")? else {
+            return Ok(());
+        };
+        let panes: Vec<&str> = value.split_whitespace().collect();
+        if !panes.contains(&pane_id) {
+            return Ok(());
+        }
+        let remaining: Vec<&str> = panes.into_iter().filter(|pane| *pane != pane_id).collect();
+        if remaining.is_empty() {
+            self.unset_global_option("@workmux_sleeping_panes")
+        } else {
+            self.set_global_option("@workmux_sleeping_panes", &remaining.join(" "))
+        }
+    }
+
     pub(crate) fn set_global_option(&self, name: &str, value: &str) -> Result<()> {
         self.tmux_cmd(&["set-option", "-g", name, value])
     }

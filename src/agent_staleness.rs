@@ -15,7 +15,13 @@ pub(crate) fn is_stale(
         return true;
     }
 
-    if !is_interrupted && matches!(status, Some(AgentStatus::Working | AgentStatus::Waiting)) {
+    // Done remains actionable until focus acknowledges and clears the status.
+    if !is_interrupted
+        && matches!(
+            status,
+            Some(AgentStatus::Working | AgentStatus::Waiting | AgentStatus::Done)
+        )
+    {
         return false;
     }
 
@@ -53,6 +59,21 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn unacknowledged_completion_does_not_age_out() {
+        for activity_ts in [Some(100), None] {
+            assert!(!is_stale(
+                activity_ts,
+                Some(AgentStatus::Done),
+                10_000,
+                60,
+                false,
+                false,
+            ));
+            assert!(is_stale(activity_ts, None, 10_000, 60, false, false));
+        }
     }
 
     #[test]

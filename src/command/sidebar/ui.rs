@@ -2386,12 +2386,12 @@ mod tests {
                 )
             })
             .collect();
-        // Waiting first, stale last: the order the header should be read in.
-        // The working icon is an animation frame, so only its count is fixed.
+        // Waiting and unacknowledged completion precede working, even without
+        // activity timestamps. The working icon is an animation frame.
         assert_eq!(tally.len(), 3);
         assert_eq!(tally[0], ("\u{1f4ac}".to_string(), 1));
-        assert_eq!(tally[1].1, 1);
-        assert_eq!(tally[2], ("\u{1f4a4}".to_string(), 1));
+        assert_eq!(tally[1], ("\u{2705}".to_string(), 1));
+        assert_eq!(tally[2].1, 1);
 
         // The tally reaches the drawn header, not just the helper.
         let lines = rendered(&mut app, 36, 26);
