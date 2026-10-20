@@ -20,6 +20,11 @@ workmux status [WORKTREE ...] [--all] [--json] [--git]
 
 Worktree arguments support `project:handle` syntax for cross-project queries.
 
+The table includes `PROJECT` and `SESSION` columns when the results are not
+limited to one repository: with `--all`, outside a Git repository, or when
+explicit targets resolve to more than one project. The `SESSION` column is
+omitted when every agent's session is named after its project.
+
 ## JSON output
 
 ```json

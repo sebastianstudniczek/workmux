@@ -76,6 +76,8 @@ struct GitInfo {
 }
 
 struct StatusRow {
+    project: String,
+    session: String,
     worktree: String,
     status: String,
     elapsed: String,
@@ -84,10 +86,12 @@ struct StatusRow {
 }
 
 impl Tabled for StatusRow {
-    const LENGTH: usize = 5;
+    const LENGTH: usize = 7;
 
     fn fields(&self) -> Vec<Cow<'_, str>> {
         vec![
+            Cow::Borrowed(&self.project),
+            Cow::Borrowed(&self.session),
             Cow::Borrowed(&self.worktree),
             Cow::Borrowed(&self.status),
             Cow::Borrowed(&self.elapsed),
@@ -98,6 +102,8 @@ impl Tabled for StatusRow {
 
     fn headers() -> Vec<Cow<'static, str>> {
         vec![
+            Cow::Borrowed("PROJECT"),
+            Cow::Borrowed("SESSION"),
             Cow::Borrowed("WORKTREE"),
             Cow::Borrowed("STATUS"),
             Cow::Borrowed("ELAPSED"),
@@ -126,6 +132,22 @@ fn git_label(git: &Option<GitInfo>) -> String {
     } else {
         parts.join(",")
     }
+}
+
+/// Whether the table needs project and session columns to disambiguate rows.
+/// True when the scope is not a single repository or the entries resolve to
+/// more than one project.
+fn spans_projects(unscoped: bool, entries: &[StatusEntry]) -> bool {
+    unscoped
+        || entries
+            .iter()
+            .any(|e| e.project_path != entries[0].project_path)
+}
+
+/// Whether every entry's session is named after its project, making the
+/// session column redundant next to the project column.
+fn sessions_match_projects(entries: &[StatusEntry]) -> bool {
+    entries.iter().all(|e| e.session == e.project)
 }
 
 fn status_label(status: Option<AgentStatus>) -> String {
@@ -386,6 +408,8 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                         e.worktree.clone()
                     };
                     StatusRow {
+                        project: e.project.clone().unwrap_or("-".to_string()),
+                        session: e.session.clone().unwrap_or("-".to_string()),
                         worktree,
                         status: e.status.clone(),
                         elapsed: e
@@ -402,9 +426,18 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
             table
                 .with(Style::blank())
                 .modify(Columns::new(..), Padding::new(0, 1, 0, 0));
+            let mut hidden_columns = Vec::new();
+            if !spans_projects(repository.is_none(), &entries) {
+                hidden_columns.extend(["PROJECT", "SESSION"]);
+            } else if sessions_match_projects(&entries) {
+                hidden_columns.push("SESSION");
+            }
             if !show_git {
+                hidden_columns.push("GIT");
+            }
+            for column in hidden_columns {
                 table.with(tabled::settings::Remove::column(
-                    tabled::settings::location::ByColumnName::new("GIT"),
+                    tabled::settings::location::ByColumnName::new(column),
                 ));
             }
             println!("{table}");
@@ -429,5 +462,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         assert!(compute_git_info(dir.path(), "feature").is_err());
+    }
+
+    fn entry(project_path: &str) -> StatusEntry {
+        StatusEntry {
+            worktree: "wt".to_string(),
+            branch: "wt".to_string(),
+            project: None,
+            project_path: Some(PathBuf::from(project_path)),
+            status: "done".to_string(),
+            elapsed_secs: None,
+            title: None,
+            pane_id: "%1".to_string(),
+            workdir: PathBuf::from(project_path),
+            agent_kind: None,
+            session: None,
+            window_name: None,
+            updated_ts: None,
+            git: None,
+        }
+    }
+
+    #[test]
+    fn spans_projects_only_when_unscoped_or_mixed() {
+        let same = [entry("/a"), entry("/a")];
+        let mixed = [entry("/a"), entry("/b")];
+
+        assert!(!spans_projects(false, &same));
+        assert!(spans_projects(true, &same));
+        assert!(spans_projects(false, &mixed));
+    }
+
+    #[test]
+    fn sessions_match_projects_requires_every_entry_to_match() {
+        let named = |project: &str, session: &str| StatusEntry {
+            project: Some(project.to_string()),
+            session: Some(session.to_string()),
+            ..entry(project)
+        };
+
+        assert!(sessions_match_projects(&[named("a", "a"), named("b", "b")]));
+        assert!(!sessions_match_projects(&[
+            named("a", "a"),
+            named("b", "generic")
+        ]));
     }
 }

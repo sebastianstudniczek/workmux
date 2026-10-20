@@ -21,6 +21,10 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 <!-- skipped: v0.1.25 -->
 <!-- skipped: v0.1.8 -->
 
+## Unreleased
+
+- Show which project each agent belongs to in `workmux status --all`, plus its tmux session when the session name differs from the project.
+
 ## v0.1.276 (2026-10-14)
 
 - Fix sidebar sizing and preserve content pane proportions when opening or closing the sidebar on tmux 3.8. ([#325](https://github.com/raine/workmux/issues/325))
