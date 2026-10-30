@@ -479,7 +479,7 @@ pub(crate) fn print_description(prefix: &str) {
     println!("{prefix}  🤖 = working  💬 = waiting for input  ✅ = done");
     println!(
         "{prefix}  {}",
-        style("https://workmux.raine.dev/guide/status-tracking").dim()
+        style("https://workmux.dev/guide/status-tracking").dim()
     );
 }
 
@@ -605,7 +605,7 @@ pub fn prompt_wizard() -> Result<()> {
             println!(
                 "{}  Learn more: {}",
                 dim,
-                style("https://workmux.raine.dev/guide/skills").dim()
+                style("https://workmux.dev/guide/skills").dim()
             );
             println!("{}", dim);
 
